@@ -1,0 +1,101 @@
+# Example Kubernetes manifest for claude-code-rc-mcp.
+# Replace the placeholder values in the Secret before applying.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: claude-rc-mcp-ns
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: claude-rc-mcp-secrets
+  namespace: claude-rc-mcp-ns
+type: Opaque
+stringData:
+  MCP_SECRET: "REPLACE_WITH_openssl_rand_hex_32"
+  SERVER_URL: "https://claude-rc-mcp.example.com"
+  SSH_HOST: "devserver.example.com"
+  SSH_PORT: "22"
+  SSH_USER: "youruser"
+  PROJECTS_BASE_DIR: "/home/youruser/projects"
+  CLAUDE_BIN: "claude"
+  SPAWN_WORKTREE: "false"
+  SSH_PRIVATE_KEY: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    REPLACE WITH THE FULL PRIVATE KEY CONTENT
+    -----END OPENSSH PRIVATE KEY-----
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claude-rc-mcp-data
+  namespace: claude-rc-mcp-ns
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-rc-mcp
+  namespace: claude-rc-mcp-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: claude-rc-mcp
+  template:
+    metadata:
+      labels:
+        app: claude-rc-mcp
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: claude-rc-mcp
+          image: ghcr.io/afonsofigs/claude-code-rc-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - secretRef:
+                name: claude-rc-mcp-secrets
+          env:
+            - name: TOKEN_STORE_PATH
+              value: "/data/oauth-tokens.json"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "10m"
+            limits:
+              memory: "192Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: claude-rc-mcp-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-rc-mcp
+  namespace: claude-rc-mcp-ns
+spec:
+  selector:
+    app: claude-rc-mcp
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 3000

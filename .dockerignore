@@ -1,0 +1,8 @@
+node_modules/
+.git/
+.github/
+.env
+k8s/
+README.md
+CLAUDE.md
+LICENSE

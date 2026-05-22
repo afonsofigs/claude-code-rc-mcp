@@ -1,0 +1,18 @@
+{
+  "name": "claude-code-rc-mcp",
+  "version": "1.0.0",
+  "description": "Self-hosted MCP server that launches Claude Code Remote Control sessions on a remote dev server over SSH",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["mcp", "claude-code", "remote-control", "ssh", "model-context-protocol", "claude"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "express": "^4.21.0",
+    "ssh2": "^1.16.0",
+    "zod": "^3.24.0"
+  }
+}
