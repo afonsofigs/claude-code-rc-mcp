@@ -54,6 +54,10 @@ node --env-file=.env server.js
   `MCP_SECRET` via SHA-256. No dynamic registration from unknown clients.
 - **Shell-injection hardening** — `name`, `path` and `id` are strictly validated
   before being interpolated into SSH commands.
+- **Opt-in bypass permissions** — `start_session` accepts a `bypass_permissions`
+  flag that appends `--dangerously-skip-permissions` to the `claude remote-control`
+  invocation. It is off by default and must be set explicitly per call; the
+  response header surfaces `bypass: on` so the choice is visible.
 
 ## Common tasks
 

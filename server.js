@@ -333,8 +333,9 @@ function createMcpServer() {
       name: z.string().describe("Short label for the session, shown in claude.ai/code (1-41 chars, [a-zA-Z0-9_-])"),
       path: z.string().describe("Project directory, relative to PROJECTS_BASE_DIR (e.g. 'my-project'). Use list_projects to discover valid values."),
       worktree: z.boolean().optional().describe("If true, spawn on-demand sessions in isolated git worktrees (--spawn worktree). Defaults to the SPAWN_WORKTREE env var."),
+      bypass_permissions: z.boolean().optional().describe("If true, launch with --dangerously-skip-permissions so the session does not prompt for tool approvals. Use with care."),
     },
-    async ({ name, path, worktree }) => {
+    async ({ name, path, worktree, bypass_permissions }) => {
       try {
         validateName(name);
         const rel = validateRelPath(path);
@@ -343,7 +344,8 @@ function createMcpServer() {
         const dir = `${PROJECTS_BASE_DIR}/${rel}`;
         const logfile = `/tmp/rc-${id}.log`;
         const spawn = (worktree ?? SPAWN_WORKTREE) ? "worktree" : "same-dir";
-        const inner = `${CLAUDE_BIN} remote-control --name ${name} --spawn ${spawn} 2>&1 | tee ${logfile}`;
+        const bypassFlag = bypass_permissions ? " --dangerously-skip-permissions" : "";
+        const inner = `${CLAUDE_BIN} remote-control --name ${name} --spawn ${spawn}${bypassFlag} 2>&1 | tee ${logfile}`;
         const remote =
           `[ -d "${dir}" ] || { echo __NO_DIR__; exit 9; }; ` +
           `command -v tmux >/dev/null 2>&1 || { echo __NO_TMUX__; exit 8; }; ` +
@@ -369,7 +371,8 @@ function createMcpServer() {
         }
         const header =
           `Session started: ${id}\n` +
-          `Project: ${rel}  ·  spawn: ${spawn}\n` +
+          `Project: ${rel}  ·  spawn: ${spawn}` +
+          (bypass_permissions ? `  ·  bypass: on` : "") + `\n` +
           (result.url ? `Session URL: ${result.url}\n` : "") +
           `\nIt should now appear in the session list at https://claude.ai/code` +
           (result.state === "starting" ? `\n(still initialising — give it a few more seconds)` : "");
