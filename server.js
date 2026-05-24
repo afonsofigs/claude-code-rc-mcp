@@ -320,15 +320,44 @@ async function pollSession(id, timeoutMs = 35000) {
   return { state: "starting", alive: true, url: null, log };
 }
 
+const SERVER_INSTRUCTIONS = `
+This MCP launches and manages Claude Code Remote Control sessions on a remote
+development server over SSH. Use it when the user asks to "open / start / launch
+a remote (control) session", "spin up Claude on the dev server", "list my remote
+sessions", "stop session X", or anything equivalent — including ambiguous asks
+like "open Claude on <project>" once it is clear they mean the remote server,
+not their local machine.
+
+Usage guidance:
+- Before calling \`start_session\`, prefer running \`list_projects\` to discover
+  valid \`path\` values rather than guessing. The \`path\` is relative to the
+  server's projects base directory.
+- Call \`list_sessions\` first if the user might already have a live session for
+  the same project — reuse it instead of creating a duplicate.
+- \`bypass_permissions\` appends \`--dangerously-skip-permissions\`. Only set it
+  when the user has explicitly asked to skip permission prompts (e.g. "no
+  approvals", "yolo mode", "bypass permissions"). Never enable it on your own
+  initiative.
+- \`worktree: true\` is for when the user wants isolated git worktrees per
+  spawned sub-session; otherwise omit it and let the server default decide.
+- After \`start_session\` returns a URL, surface it to the user — that is the
+  link they open to drive the session from claude.ai/code.
+- \`stop_session\` is destructive (kills the tmux session); confirm with the
+  user before calling it unless they named the id explicitly.
+`.trim();
+
 function createMcpServer() {
-  const server = new McpServer({ name: "claude-code-rc-mcp", version: "1.0.0" });
+  const server = new McpServer(
+    { name: "claude-code-rc-mcp", version: "1.0.0" },
+    { instructions: SERVER_INSTRUCTIONS }
+  );
 
   server.tool(
     "start_session",
-    "Start a new Claude Code Remote Control session on the remote development server. " +
-      "SSHes in, launches `claude remote-control` inside a detached tmux session in the chosen " +
-      "project directory, and returns the session URL once it is available. The session then " +
-      "also shows up in the session list at claude.ai/code.",
+    "Launch a new `claude remote-control` session on the remote dev server (over SSH, inside a detached tmux session) and return its URL. " +
+      "Use when the user asks to start / open / spin up a remote Claude Code session on a given project. " +
+      "Prefer calling `list_projects` first to discover valid `path` values, and `list_sessions` to avoid duplicating a live session for the same project. " +
+      "Set `bypass_permissions` only when the user explicitly asks to skip approval prompts.",
     {
       name: z.string().describe("Short label for the session, shown in claude.ai/code (1-41 chars, [a-zA-Z0-9_-])"),
       path: z.string().describe("Project directory, relative to PROJECTS_BASE_DIR (e.g. 'my-project'). Use list_projects to discover valid values."),
@@ -385,9 +414,9 @@ function createMcpServer() {
 
   server.tool(
     "list_sessions",
-    "List the active Claude Code Remote Control sessions (tmux sessions named rc-*) on the remote " +
-      "server, with each session's URL when available. Also cleans up orphan log files left by " +
-      "sessions that have already ended.",
+    "List the currently active Claude Code Remote Control sessions on the remote server, with each session's URL when available. " +
+      "Use when the user asks 'what sessions are running', 'do I have a session for X', or before `start_session` to avoid duplicates. " +
+      "Also reaps orphan log files left by sessions that have already ended.",
     {},
     async () => {
       try {
@@ -420,7 +449,9 @@ function createMcpServer() {
 
   server.tool(
     "stop_session",
-    "Stop a Claude Code Remote Control session by its id (kills the tmux session and removes its log file).",
+    "Stop a Claude Code Remote Control session by its full id (kills the tmux session and removes its log file). " +
+      "Destructive — any in-progress work in that session is lost. Confirm with the user before calling unless they explicitly named the id. " +
+      "Use `list_sessions` to look up the id if the user only referenced the session by name.",
     {
       id: z.string().describe("Full session id as returned by start_session / list_sessions (e.g. 'my-project-a1b2c3')"),
     },
@@ -441,9 +472,9 @@ function createMcpServer() {
 
   server.tool(
     "list_projects",
-    "List the project directories available on the remote server under PROJECTS_BASE_DIR. " +
-      "Only directories that look like projects (contain a .git or .claude entry) are returned. " +
-      "Use the returned names as the `path` input of start_session.",
+    "List the project directories available on the remote server (only those containing a .git or .claude entry). " +
+      "Call this before `start_session` whenever the user-supplied project name is ambiguous, abbreviated, or you would otherwise be guessing the `path`. " +
+      "The returned names are the exact values to pass as `path`.",
     {},
     async () => {
       try {

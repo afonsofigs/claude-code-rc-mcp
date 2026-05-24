@@ -58,11 +58,23 @@ node --env-file=.env server.js
   flag that appends `--dangerously-skip-permissions` to the `claude remote-control`
   invocation. It is off by default and must be set explicitly per call; the
   response header surfaces `bypass: on` so the choice is visible.
+- **Server-level instructions** — the `McpServer` is constructed with an
+  `instructions` string (`SERVER_INSTRUCTIONS`) that the SDK delivers to the
+  client at `initialize` time. It tells the model when to reach for these tools
+  (trigger phrasings, ordering rules: `list_projects` → `start_session`,
+  `list_sessions` before reusing/duplicating, etc.) and which behaviours need
+  explicit user consent (`bypass_permissions`, `stop_session`). Tool
+  descriptions echo the same cues so they fire even if the client truncates the
+  server instructions.
 
 ## Common tasks
 
 ### Add a new tool
-Add another `server.tool()` call inside `createMcpServer()`.
+Add another `server.tool()` call inside `createMcpServer()`. Write the tool
+description with *trigger phrasings* the user might say, not just what the tool
+does — that is what the model reads to decide when to invoke it. If the new
+tool changes the recommended order of operations, update `SERVER_INSTRUCTIONS`
+too so the guidance stays consistent.
 
 ### Change OAuth token expiry
 In `OAuthProvider.exchangeAuthorizationCode()`, change `expiresIn` (default 86400 = 24h).
