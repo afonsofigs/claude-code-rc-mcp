@@ -248,7 +248,27 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function stripAnsi(s) {
   return s
     .replace(/\][^]*(?:|\\)/g, "") // OSC (e.g. hyperlinks)
-    .replace(/\[[0-9;?]*[ -/]*[@-~]/g, ""); // CSI (cursor / colour codes)
+    .replace(/\[[0-9;?]*[ -/]*[@-~]/g, "") // CSI (cursor / colour codes)
+    .replace(/\r/g, "\n"); // CR — TUI redraws overwrite lines in place
+}
+
+/**
+ * The canonical claude.ai/code session link. Matching it exactly matters when
+ * reading a rendered pane: the TUI also shows docs and promo links, and the URL
+ * can end up flush against box-drawing characters, both of which the generic
+ * "everything up to whitespace" pattern below would happily return.
+ */
+function extractSessionUrl(text) {
+  const m = text.match(/https?:\/\/(?:claude\.ai|claude\.com)\/code\/[A-Za-z0-9_-]+/);
+  return m ? m[0] : null;
+}
+
+/** As above, falling back to the first URL of any shape — for logs only. */
+function extractUrl(log) {
+  const session = extractSessionUrl(log);
+  if (session) return session;
+  const any = log.match(/https?:\/\/[^\s'"\]]+/);
+  return any ? any[0] : null;
 }
 
 /** Last `n` meaningful lines of a log, with consecutive duplicates collapsed. */
@@ -298,22 +318,33 @@ const fail = (text) => ({ content: [{ type: "text", text }], isError: true });
 // --- Session lifecycle ---
 
 /**
- * Poll the per-session logfile until the remote-control URL appears, the tmux
- * session dies (claude exited / errored), or the timeout elapses.
+ * Poll a session until the remote-control URL appears, the tmux session dies
+ * (claude exited / errored), or the timeout elapses.
+ *
+ * `fromPane` is for interactive sessions: their TUI draws the URL in chunks
+ * separated by cursor-positioning escapes, so stripping the escapes out of the
+ * raw log yields a mangled URL, while tmux — being the terminal emulator —
+ * renders it correctly. It is deliberately off for the Remote Control server,
+ * whose log is clean line output and whose *pane* is the unreliable one: there
+ * the URL is long enough to be wrapped across two rows. The logfile is read in
+ * both cases regardless — it is what the caller reports as the startup tail,
+ * and all that survives a session that dies before it is ever ready.
  */
-async function pollSession(id, timeoutMs = 35000) {
+async function pollSession(id, { timeoutMs = 35000, fromPane = false } = {}) {
   const deadline = Date.now() + timeoutMs;
   let log = "";
   while (Date.now() < deadline) {
     await sleep(2000);
     const r = await sshExec(
       `tmux has-session -t rc-${id} 2>/dev/null && echo __ALIVE__ || echo __DEAD__; ` +
+      `echo __PANE__; tmux capture-pane -p -S -200 -t rc-${id} 2>/dev/null || true; ` +
       `echo __LOG__; cat /tmp/rc-${id}.log 2>/dev/null || true`
     );
-    const [head, ...rest] = r.stdout.split("__LOG__");
+    const [head, ...paneAndLog] = r.stdout.split("__PANE__");
+    const [pane, ...rest] = paneAndLog.join("__PANE__").split("__LOG__");
     log = stripAnsi(rest.join("__LOG__")).trim();
     const alive = head.includes("__ALIVE__");
-    const url = (log.match(/https?:\/\/[^\s'"\]]+/g) || [])[0];
+    const url = fromPane ? extractSessionUrl(pane) : extractUrl(log);
     if (url) return { state: "ready", alive, url, log };
     if (!alive) return { state: "exited", alive: false, url: null, log };
   }
@@ -338,8 +369,14 @@ Usage guidance:
   when the user has explicitly asked to skip permission prompts (e.g. "no
   approvals", "yolo mode", "bypass permissions"). Never enable it on your own
   initiative.
+- \`prompt\` makes the session start working immediately on that instruction —
+  use it whenever the user says what the session should *do* ("open a session
+  on X and run the tests", "start one on Y and run /security-review"), not just
+  where to open it. Slash commands are valid prompts. The session stays open
+  after the task, so the user can take over from claude.ai/code.
 - \`worktree: true\` is for when the user wants isolated git worktrees per
-  spawned sub-session; otherwise omit it and let the server default decide.
+  spawned sub-session; otherwise omit it and let the server default decide. It
+  does not apply when \`prompt\` is set (that mode runs a single session).
 - After \`start_session\` returns a URL, surface it to the user — that is the
   link they open to drive the session from claude.ai/code.
 - \`stop_session\` is destructive (kills the tmux session); confirm with the
@@ -354,54 +391,101 @@ function createMcpServer() {
 
   server.tool(
     "start_session",
-    "Launch a new `claude remote-control` session on the remote dev server (over SSH, inside a detached tmux session) and return its URL. " +
+    "Launch a new Claude Code Remote Control session on the remote dev server (over SSH, inside a detached tmux session) and return its URL. " +
       "Use when the user asks to start / open / spin up a remote Claude Code session on a given project. " +
+      "Pass `prompt` when the user wants the session to start working right away — 'open a session on X and run the tests', 'start a session and run /security-review'; the session stays open afterwards so they can take over from claude.ai/code. " +
       "Prefer calling `list_projects` first to discover valid `path` values, and `list_sessions` to avoid duplicating a live session for the same project. " +
       "Set `bypass_permissions` only when the user explicitly asks to skip approval prompts.",
     {
       name: z.string().describe("Short label for the session, shown in claude.ai/code (1-41 chars, [a-zA-Z0-9_-])"),
       path: z.string().describe("Project directory, relative to PROJECTS_BASE_DIR (e.g. 'my-project'). Use list_projects to discover valid values."),
-      worktree: z.boolean().optional().describe("If true, spawn on-demand sessions in isolated git worktrees (--spawn worktree). Defaults to the SPAWN_WORKTREE env var."),
+      prompt: z.string().optional().describe("Initial prompt or slash command to run as soon as the session opens (e.g. 'run the test suite' or '/security-review'). Switches the session to single-session mode (`claude --rc`), where `worktree` does not apply."),
+      worktree: z.boolean().optional().describe("If true, spawn on-demand sessions in isolated git worktrees (--spawn worktree). Defaults to the SPAWN_WORKTREE env var. Ignored when `prompt` is set."),
       bypass_permissions: z.boolean().optional().describe("If true, launch with --dangerously-skip-permissions so the session does not prompt for tool approvals. Use with care."),
     },
-    async ({ name, path, worktree, bypass_permissions }) => {
+    async ({ name, path, prompt, worktree, bypass_permissions }) => {
       try {
         validateName(name);
         const rel = validateRelPath(path);
+        const task = (prompt || "").trim();
         const suffix = randomBytes(3).toString("hex");
         const id = `${name}-${suffix}`;
         const dir = `${PROJECTS_BASE_DIR}/${rel}`;
         const logfile = `/tmp/rc-${id}.log`;
+        const promptfile = `/tmp/rc-${id}.prompt`;
         const spawn = (worktree ?? SPAWN_WORKTREE) ? "worktree" : "same-dir";
         const bypassFlag = bypass_permissions ? " --dangerously-skip-permissions" : "";
-        const inner = `${CLAUDE_BIN} remote-control --name ${name} --spawn ${spawn}${bypassFlag} 2>&1 | tee ${logfile}`;
+
+        // Two launch shapes. Without a prompt: the persistent Remote Control
+        // server (`claude remote-control`), which supports --spawn. With one:
+        // a single interactive session (`claude --rc <name> "<prompt>"`), the
+        // only form that accepts an initial prompt.
+        //
+        // The prompt is never interpolated into the command line — it is
+        // base64'd here, decoded into a file on the server, and read back with
+        // "$(cat …)", so no part of it is ever seen by a shell parser.
+        //
+        // An interactive session also needs a real TTY: piping stdout into
+        // `tee` makes Claude Code fall back to --print and refuse to start, so
+        // the log is captured with `tmux pipe-pane` off the pane's own TTY.
+        // That pipe is detached again once the session is up (see below) —
+        // it mirrors every TUI redraw, so left on it would grow without bound.
+        let setup = "";
+        let inner;
+        let capture = "";
+        if (task) {
+          const b64 = Buffer.from(task, "utf-8").toString("base64");
+          setup = `printf %s '${b64}' | base64 -d > ${promptfile} || { echo __NO_PROMPT_FILE__; exit 6; }; `;
+          inner = `${CLAUDE_BIN}${bypassFlag} --rc ${name} "$(cat ${promptfile})"`;
+          capture = ` && tmux pipe-pane -o -t rc-${id} "cat >> ${logfile}"`;
+        } else {
+          inner = `${CLAUDE_BIN} remote-control --name ${name} --spawn ${spawn}${bypassFlag} 2>&1 | tee ${logfile}`;
+        }
         const remote =
           `[ -d "${dir}" ] || { echo __NO_DIR__; exit 9; }; ` +
           `command -v tmux >/dev/null 2>&1 || { echo __NO_TMUX__; exit 8; }; ` +
           `tmux has-session -t rc-${id} 2>/dev/null && { echo __EXISTS__; exit 7; }; ` +
-          `tmux new-session -d -s rc-${id} -c "${dir}" "${inner}" && echo __STARTED__`;
+          setup +
+          `tmux new-session -d -s rc-${id} -c "${dir}" '${inner}'${capture} && echo __STARTED__`;
 
         const r = await sshExec(remote);
         if (r.stdout.includes("__NO_DIR__")) return fail(`Project directory not found: ${rel}`);
         if (r.stdout.includes("__NO_TMUX__")) return fail("tmux is not installed on the remote server.");
+        if (r.stdout.includes("__NO_PROMPT_FILE__")) return fail(`Could not write the prompt file ${promptfile} on the remote server.`);
         if (!r.stdout.includes("__STARTED__")) {
           return fail(`Failed to start tmux session (exit ${r.code}).\n${r.stdout}\n${r.stderr}`.trim());
         }
 
-        const result = await pollSession(id);
+        // With a prompt the session is busy working while Remote Control is
+        // still connecting, so the URL takes noticeably longer to show up.
+        const result = await pollSession(id, { timeoutMs: task ? 50000 : 35000, fromPane: Boolean(task) });
         const tail = logTail(result.log);
 
         if (result.state === "exited") {
-          await sshExec(`rm -f ${logfile}`);
+          await sshExec(`rm -f ${logfile} ${promptfile}`);
           return fail(
             `Session "${id}" exited before becoming ready — likely a startup error ` +
             `(e.g. Claude Code not authenticated on the server).\n\nLog:\n${tail}`
           );
         }
+
+        // The startup log has served its purpose. Detach the pipe so the TUI
+        // stops appending to it, and record the URL in its own file — by the
+        // time `list_sessions` runs, the URL has usually scrolled out of the
+        // pane, and the raw log only holds the escape-split version of it.
+        const post = [];
+        if (task) post.push(`tmux pipe-pane -t rc-${id} 2>/dev/null`);
+        if (result.url) {
+          const urlB64 = Buffer.from(result.url, "utf-8").toString("base64");
+          post.push(`printf %s '${urlB64}' | base64 -d > /tmp/rc-${id}.url`);
+        }
+        if (post.length) await sshExec(`${post.join("; ")}; true`);
+
         const header =
           `Session started: ${id}\n` +
-          `Project: ${rel}  ·  spawn: ${spawn}` +
+          `Project: ${rel}  ·  ` + (task ? `mode: single-session` : `spawn: ${spawn}`) +
           (bypass_permissions ? `  ·  bypass: on` : "") + `\n` +
+          (task ? `Running: ${task.length > 120 ? `${task.slice(0, 117)}...` : task}\n` : "") +
           (result.url ? `Session URL: ${result.url}\n` : "") +
           `\nIt should now appear in the session list at https://claude.ai/code` +
           (result.state === "starting" ? `\n(still initialising — give it a few more seconds)` : "");
@@ -414,7 +498,8 @@ function createMcpServer() {
 
   server.tool(
     "list_sessions",
-    "List the currently active Claude Code Remote Control sessions on the remote server, with each session's URL when available. " +
+    "List the currently active Claude Code Remote Control sessions on the remote server, with each session's URL when available " +
+      "(from the URL recorded at startup, falling back to the live pane and then the log for sessions that were still initialising). " +
       "Use when the user asks 'what sessions are running', 'do I have a session for X', or before `start_session` to avoid duplicates. " +
       "Also reaps orphan log files left by sessions that have already ended.",
     {},
@@ -426,8 +511,12 @@ function createMcpServer() {
           `for f in /tmp/rc-*.log; do [ -e "$f" ] || continue; ` +
           `id=$(basename "$f" .log); id=${'$'}{id#rc-}; ` +
           `if tmux has-session -t "rc-$id" 2>/dev/null; then ` +
-          `echo "URL $id $(grep -oE 'https?://[^[:space:]]+' "$f" 2>/dev/null | head -1)"; ` +
-          `else echo "CLEANED $f"; rm -f "$f"; fi; done`;
+          `u=$(cat "/tmp/rc-$id.url" 2>/dev/null); ` +
+          `[ -n "$u" ] || u=$(tmux capture-pane -p -S -200 -t "rc-$id" 2>/dev/null | grep -oE 'https?://(claude\\.ai|claude\\.com)/code/[A-Za-z0-9_-]+' | head -1); ` +
+          `[ -n "$u" ] || u=$(grep -aoE 'https?://(claude\\.ai|claude\\.com)/code/[A-Za-z0-9_-]+' "$f" 2>/dev/null | head -1); ` +
+          `[ -n "$u" ] || u=$(grep -aoE 'https?://[^[:space:]]+' "$f" 2>/dev/null | head -1); ` +
+          `echo "URL $id $u"; ` +
+          `else echo "CLEANED $f"; rm -f "$f" "/tmp/rc-$id.prompt" "/tmp/rc-$id.url"; fi; done`;
         const r = await sshExec(remote);
         const lines = r.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
         const ids = lines.filter((l) => l.startsWith("SESSION ")).map((l) => l.slice(8));
@@ -460,7 +549,7 @@ function createMcpServer() {
         validateId(id);
         const r = await sshExec(
           `tmux kill-session -t rc-${id} 2>/dev/null && echo __KILLED__ || echo __NOT_FOUND__; ` +
-          `rm -f /tmp/rc-${id}.log`
+          `rm -f /tmp/rc-${id}.log /tmp/rc-${id}.prompt /tmp/rc-${id}.url`
         );
         if (r.stdout.includes("__KILLED__")) return ok(`Session "${id}" stopped.`);
         return fail(`No active session with id "${id}".`);

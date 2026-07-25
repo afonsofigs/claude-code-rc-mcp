@@ -40,12 +40,38 @@ node --env-file=.env server.js
 - **tmux workaround** — `claude remote-control` requires a TTY and has no headless
   mode. Each session runs as `claude remote-control … 2>&1 | tee /tmp/rc-<id>.log`
   inside a detached `tmux` session named `rc-<id>`.
+- **Two launch shapes** — `claude remote-control` takes no initial prompt (its
+  usage is `[options]` only). So when `start_session` is given a `prompt`, it
+  launches `claude --rc <name> "<prompt>"` instead: a single interactive session
+  with Remote Control enabled, which does accept a positional prompt. The
+  trade-off is `--spawn` — it exists only on the server form, so `worktree` is
+  ignored in prompt mode. The session stays open after the task completes.
+- **Prompt never touches a shell parser** — it is base64-encoded in Node,
+  decoded into `/tmp/rc-<id>.prompt` on the server, and read back inside the
+  tmux command as `"$(cat …)"`. That is why prompts can hold quotes, `$(…)`,
+  backticks and newlines without any escaping logic, and why the `NAME_RE`-style
+  validation used for `name`/`path`/`id` is not needed for it.
+- **pipe-pane, not `tee`, in prompt mode** — an interactive session checks
+  whether stdout is a TTY; behind `| tee` it falls back to `--print` and exits
+  with "Input must be provided…". So the pane runs `claude` directly and the log
+  is captured with `tmux pipe-pane`. The pipe is detached once the session is up:
+  it mirrors every TUI redraw and would otherwise grow without bound.
+- **URL source differs per mode** — the interactive TUI draws the URL in chunks
+  split by cursor-positioning escapes, so `stripAnsi` on the raw log yields a
+  mangled URL (a dropped character); `tmux capture-pane` renders it correctly.
+  The Remote Control server is the mirror image: its `tee` log is clean line
+  output, while its pane wraps the (longer) environment URL across two rows.
+  Hence `pollSession({fromPane})` — pane first for prompt mode only. The
+  resolved URL is then written to `/tmp/rc-<id>.url` so `list_sessions` reports
+  exactly what `start_session` returned instead of re-parsing the log.
 - **Sessions auto-terminate** — because the pane runs the `claude | tee` pipeline
   directly, the `tmux` session ends when `claude` exits. So `list_sessions` only
   ever shows live sessions; there are no zombie tmux sessions to reap. The logfile
   outlives the session, so `list_sessions` lazily deletes orphan `/tmp/rc-*.log`.
-- **Logfile, not `capture-pane`** — `start_session` polls the logfile, which
-  survives even if the session dies on a startup error; `capture-pane` would not.
+- **Logfile, not `capture-pane`, for diagnostics** — `start_session` polls the
+  logfile, which survives even if the session dies on a startup error;
+  `capture-pane` would not. (`capture-pane` is used only to read the URL of a
+  live interactive session — see below.)
 - **Unique session ids** — `start_session` appends a random suffix
   (`rc-<name>-<random>`) so reusing the same `name` never collides.
 - **OAuth 2.1 file-persisted** — tokens stored in `TOKEN_STORE_PATH` via `TokenStore`.

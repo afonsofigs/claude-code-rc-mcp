@@ -43,25 +43,35 @@ The Remote Control connection itself is **outbound-only** (the server connects t
 
 ### `start_session`
 
-SSHes to the server and launches `claude remote-control` inside a detached `tmux` session in the chosen project directory, then returns the session URL.
+SSHes to the server and launches Claude Code Remote Control inside a detached `tmux` session in the chosen project directory, then returns the session URL.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | Yes | Short label, shown in claude.ai/code (1-41 chars, `[a-zA-Z0-9_-]`) |
 | `path` | string | Yes | Project directory, relative to `PROJECTS_BASE_DIR` |
-| `worktree` | boolean | No | Spawn on-demand work in isolated git worktrees. Defaults to `SPAWN_WORKTREE`. |
+| `prompt` | string | No | Initial prompt or slash command to run as soon as the session opens |
+| `worktree` | boolean | No | Spawn on-demand work in isolated git worktrees. Defaults to `SPAWN_WORKTREE`. Ignored when `prompt` is set. |
+| `bypass_permissions` | boolean | No | Launch with `--dangerously-skip-permissions`, so the session never waits for tool approvals |
 
 The `tmux` session is named `rc-<name>-<random>`; the random suffix avoids collisions when the same `name` is reused.
 
+**Two launch modes.** Without `prompt`, the session is the persistent Remote Control *server* (`claude remote-control`) — it accepts multiple concurrent sessions and honours `--spawn`. With `prompt`, it is a single interactive session started as `claude --rc <name> "<prompt>"`, the only form that takes an initial instruction; `worktree`/spawn does not apply there. Either way the session stays open when the task finishes, so you can pick it up from claude.ai/code:
+
+> *"Start a session on `my-project` and run `/security-review`"* → the review is already running by the time you open the link.
+
+The prompt is never interpolated into a shell command: it is base64-encoded, decoded into `/tmp/rc-<id>.prompt` on the server, and read back with `"$(cat …)"`, so no part of it reaches a shell parser.
+
 ### `list_sessions`
 
-Lists the active `rc-*` `tmux` sessions and their URLs. Also cleans up orphan log files left by sessions that already ended.
+Lists the active `rc-*` `tmux` sessions and their URLs (read from `/tmp/rc-<id>.url`, written by `start_session`). Also cleans up the orphan `/tmp/rc-<id>.{log,prompt,url}` files left by sessions that already ended.
 
 ### `stop_session`
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | Yes | Full session id from `start_session` / `list_sessions` (e.g. `my-project-a1b2c3`) |
+
+Kills the `tmux` session and removes its `/tmp/rc-<id>.{log,prompt,url}` files.
 
 ### `list_projects`
 
