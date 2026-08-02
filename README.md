@@ -26,13 +26,16 @@ Claude.ai / Mobile app / Scheduled tasks
   Session shows up at claude.ai/code  ->  you attach to it
 ```
 
+Once a conversational session is up, `send_prompt` / `get_reply` drive it over the same SSH channel — the prompt goes in through the `tmux` paste buffer, the final answer comes back out of the session's JSONL transcript.
+
 The Remote Control connection itself is **outbound-only** (the server connects to the Anthropic API; no inbound ports). SSH is only the channel this MCP uses to *launch* the process.
 
 > **Note on `tmux`.** `claude remote-control` still requires a TTY — there is no `--headless`/`--daemon` mode yet. Running it inside a detached `tmux` session provides the TTY, survives the SSH connection closing, and gives `list`/`kill` of sessions for free. When a headless mode lands, the `tmux` layer can be dropped.
 
 ## Features
 
-- **4 tools**: `start_session`, `list_sessions`, `stop_session`, `list_projects`
+- **6 tools**: `start_session`, `send_prompt`, `get_reply`, `list_sessions`, `stop_session`, `list_projects`
+- **Two-way**: prompt a session that is already running and get its final answer back, without leaving the chat
 - **OAuth 2.1**: fixed client credentials derived from `MCP_SECRET` — no separate user database
 - **Persistent OAuth tokens**: issued tokens are written to disk so they survive container/pod restarts
 - **Streamable HTTP**: `/mcp` endpoint for remote MCP connections
@@ -50,20 +53,55 @@ SSHes to the server and launches Claude Code Remote Control inside a detached `t
 | `name` | string | Yes | Short label, shown in claude.ai/code (1-41 chars, `[a-zA-Z0-9_-]`) |
 | `path` | string | Yes | Project directory, relative to `PROJECTS_BASE_DIR` |
 | `prompt` | string | No | Initial prompt or slash command to run as soon as the session opens |
-| `worktree` | boolean | No | Spawn on-demand work in isolated git worktrees. Defaults to `SPAWN_WORKTREE`. Ignored when `prompt` is set. |
+| `interactive` | boolean | No | Open an empty conversational session, ready for `send_prompt`. Implied by `prompt` |
+| `worktree` | boolean | No | Spawn on-demand work in isolated git worktrees. Defaults to `SPAWN_WORKTREE`. Ignored for conversational sessions |
 | `bypass_permissions` | boolean | No | Launch with `--dangerously-skip-permissions`, so the session never waits for tool approvals |
 
 The `tmux` session is named `rc-<name>-<random>`; the random suffix avoids collisions when the same `name` is reused.
 
-**Two launch modes.** Without `prompt`, the session is the persistent Remote Control *server* (`claude remote-control`) — it accepts multiple concurrent sessions and honours `--spawn`. With `prompt`, it is a single interactive session started as `claude --rc <name> "<prompt>"`, the only form that takes an initial instruction; `worktree`/spawn does not apply there. Either way the session stays open when the task finishes, so you can pick it up from claude.ai/code:
+**Two launch modes.** Plain, the session is the persistent Remote Control *server* (`claude remote-control`) — it accepts multiple concurrent sessions and honours `--spawn`. With `prompt` or `interactive`, it is a single **conversational** session started as `claude --rc <name> ["<prompt>"]`: the only form that takes an initial instruction, and the only one you can send further prompts to. `worktree`/spawn does not apply there. Either way the session stays open when the task finishes, so you can pick it up from claude.ai/code:
 
 > *"Start a session on `my-project` and run `/security-review`"* → the review is already running by the time you open the link.
 
 The prompt is never interpolated into a shell command: it is base64-encoded, decoded into `/tmp/rc-<id>.prompt` on the server, and read back with `"$(cat …)"`, so no part of it reaches a shell parser.
 
+### `send_prompt`
+
+Sends a follow-up prompt to a conversational session that is already running, and returns its **final answer** — so you can hold a whole conversation with a remote session from Claude.ai, not just start one.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | Yes | Full session id from `start_session` / `list_sessions` |
+| `prompt` | string | Yes | What to ask. Slash commands and multi-line text both work |
+| `wait_seconds` | number | No | How long to wait for the answer before returning (default `90`, max `240`) |
+
+The prompt is typed into the live conversation, so the session keeps its full context and the exchange stays visible at claude.ai/code. Turns that outlast `wait_seconds` are not lost — the call returns "still working" and [`get_reply`](#get_reply) collects the answer afterwards.
+
+Only conversational sessions accept it; against a Remote Control *server* session it returns an explanatory error, because that process spawns its sessions as separate children and has no conversation of its own.
+
+### `get_reply`
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | Yes | Full session id |
+| `wait_seconds` | number | No | How long to wait if the turn is still running (default `90`, max `240`, `0` to peek) |
+
+Collects the final answer of the session's current turn: the reply to the last `send_prompt`, or — if no prompt was ever sent through the MCP — the reply to the `prompt` the session was started with. That second case is the useful one for *"start a session on X and run the tests"*: come back later and read the result.
+
+#### How the answer is read back
+
+Not by scraping the terminal. Claude Code writes every conversation to a JSONL transcript under `~/.claude/projects/<project>/<uuid>.jsonl`, and each assistant entry carries an explicit `stop_reason` — so the end of a turn is a fact to be read, not a guess about whether the pane has stopped changing. The reply comes out as clean text: no ANSI escapes, no box-drawing, nothing truncated to the terminal width.
+
+The transcript is located by mtime rather than by rebuilding the CLI's directory-slug rules: `/tmp/rc-<id>.meta` is written immediately before `tmux` launches the session, so the session's transcript is the newest `.jsonl` touched after that whose recorded `cwd` is the project directory. The path is then cached in `/tmp/rc-<id>.tr`.
+
+Two things follow from this that are worth knowing:
+
+- **Approval prompts block the turn.** A session running without `bypass_permissions` stops mid-turn on the tool-approval box and never reaches a final answer. `send_prompt` and `get_reply` detect it and say so — with the session URL — instead of waiting out the timeout. Sessions you intend to drive this way are best started with `bypass_permissions`.
+- **The reply is anchored to the prompt, not to the clock.** If the session was already working when the prompt arrived, that prompt queues up, and the older turn's answer — which also lands after the prompt was sent — is not mistaken for it.
+
 ### `list_sessions`
 
-Lists the active `rc-*` `tmux` sessions and their URLs (read from `/tmp/rc-<id>.url`, written by `start_session`). Also cleans up the orphan `/tmp/rc-<id>.{log,prompt,url}` files left by sessions that already ended.
+Lists the active `rc-*` `tmux` sessions with their URLs (read from `/tmp/rc-<id>.url`, written by `start_session`) and their mode, so you can tell which ones accept `send_prompt`. Also cleans up the orphan `/tmp/rc-<id>.*` files left by sessions that already ended.
 
 ### `stop_session`
 
@@ -71,7 +109,7 @@ Lists the active `rc-*` `tmux` sessions and their URLs (read from `/tmp/rc-<id>.
 |-----------|------|----------|-------------|
 | `id` | string | Yes | Full session id from `start_session` / `list_sessions` (e.g. `my-project-a1b2c3`) |
 
-Kills the `tmux` session and removes its `/tmp/rc-<id>.{log,prompt,url}` files.
+Kills the `tmux` session and removes its `/tmp/rc-<id>.*` files.
 
 ### `list_projects`
 

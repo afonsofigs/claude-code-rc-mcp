@@ -3,9 +3,9 @@
 ## What is this?
 
 A self-hosted MCP server that launches `claude remote-control` sessions on a remote
-development server over SSH. Four tools: `start_session`, `list_sessions`,
-`stop_session`, `list_projects`. Protected by OAuth 2.1 with credentials derived
-from `MCP_SECRET`.
+development server over SSH, and holds conversations with them. Six tools:
+`start_session`, `send_prompt`, `get_reply`, `list_sessions`, `stop_session`,
+`list_projects`. Protected by OAuth 2.1 with credentials derived from `MCP_SECRET`.
 
 ## Stack
 
@@ -42,10 +42,14 @@ node --env-file=.env server.js
   inside a detached `tmux` session named `rc-<id>`.
 - **Two launch shapes** — `claude remote-control` takes no initial prompt (its
   usage is `[options]` only). So when `start_session` is given a `prompt`, it
-  launches `claude --rc <name> "<prompt>"` instead: a single interactive session
-  with Remote Control enabled, which does accept a positional prompt. The
-  trade-off is `--spawn` — it exists only on the server form, so `worktree` is
-  ignored in prompt mode. The session stays open after the task completes.
+  launches `claude --rc <name> "<prompt>"` instead (`--rc` is the short form of
+  `--remote-control [name]`): a single interactive session with Remote Control
+  enabled, which does accept a positional prompt. `interactive: true` is the
+  same shape with the prompt omitted. Both are "conversational" mode — the only
+  mode `send_prompt` works on, because the server form spawns its sessions as
+  separate child processes and its pane is not a chat. The trade-off is
+  `--spawn`, which exists only on the server form, so `worktree` is ignored
+  there. The session stays open after the task completes.
 - **Prompt never touches a shell parser** — it is base64-encoded in Node,
   decoded into `/tmp/rc-<id>.prompt` on the server, and read back inside the
   tmux command as `"$(cat …)"`. That is why prompts can hold quotes, `$(…)`,
@@ -66,12 +70,47 @@ node --env-file=.env server.js
   exactly what `start_session` returned instead of re-parsing the log.
 - **Sessions auto-terminate** — because the pane runs the `claude | tee` pipeline
   directly, the `tmux` session ends when `claude` exits. So `list_sessions` only
-  ever shows live sessions; there are no zombie tmux sessions to reap. The logfile
-  outlives the session, so `list_sessions` lazily deletes orphan `/tmp/rc-*.log`.
+  ever shows live sessions; there are no zombie tmux sessions to reap. The scratch
+  files outlive the session, so `list_sessions` lazily deletes the orphan
+  `/tmp/rc-<id>.{log,prompt,url,meta,tr,pending,send}` set.
 - **Logfile, not `capture-pane`, for diagnostics** — `start_session` polls the
   logfile, which survives even if the session dies on a startup error;
   `capture-pane` would not. (`capture-pane` is used only to read the URL of a
   live interactive session — see below.)
+- **Replies come from the transcript, not the pane** — Claude Code writes every
+  conversation to `~/.claude/projects/<slug>/<uuid>.jsonl`, where each assistant
+  entry carries an explicit `stop_reason`. So `send_prompt` knows a turn is over
+  as a fact, instead of guessing from a pane that stopped changing, and the text
+  it returns needs no ANSI stripping or unwrapping. A turn is finished when the
+  last main-chain entry is an assistant message with neither a `tool_use` block
+  nor `stop_reason: "tool_use"` — both checks are needed, because thinking, text
+  and tool_use arrive as separate entries, so a text-only entry can still be the
+  prelude to a tool call. Sidechain (sub-agent) entries are skipped: they finish
+  mid-turn and would otherwise read as the answer.
+- **Transcript found by mtime, not by slugifying the path** — the slug escaping
+  rules belong to the CLI. `/tmp/rc-<id>.meta` is written immediately before
+  `tmux new-session`, so its mtime is the cutoff: the session's transcript is
+  the newest `.jsonl` touched after it whose recorded `cwd` is the project dir.
+  Cached in `/tmp/rc-<id>.tr`.
+- **`paste-buffer`, not `send-keys`, for the prompt** — `send-keys` would turn
+  every newline of a multi-line prompt into a submit and replay a long prompt
+  keystroke by keystroke. `paste-buffer -p` wraps it in bracketed-paste markers
+  so the TUI takes it as one block; the Enter afterwards is what submits it.
+- **The reply is anchored on the prompt, not the clock** — a turn that was
+  already running when the prompt was pasted also finishes *after* the send
+  mark, and its answer is not the one that was asked for. So the turn starts at
+  the last non-`tool_result` user entry after the mark; no such entry means the
+  prompt is still queued, not that there is nothing to report.
+- **The send mark is stamped by the remote host** — it is compared against
+  timestamps written by the session, so a container clock a few seconds ahead of
+  the dev server would place it in their future and the reply would never be
+  recognised. `date -u` on the server, echoed back over SSH.
+- **Approval prompts are reported, not waited out** — without
+  `bypass_permissions` a session stalls mid-turn on the tool-approval box and
+  never reaches a final answer, so `send_prompt`/`get_reply` detect the box in
+  the pane and return it (with the session URL) instead of burning the timeout.
+  The detection regex wants the question *and* the numbered list that follows,
+  including the box-drawing characters `capture-pane` renders around them.
 - **Unique session ids** — `start_session` appends a random suffix
   (`rc-<name>-<random>`) so reusing the same `name` never collides.
 - **OAuth 2.1 file-persisted** — tokens stored in `TOKEN_STORE_PATH` via `TokenStore`.
