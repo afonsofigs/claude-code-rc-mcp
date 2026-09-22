@@ -159,6 +159,16 @@ node --env-file=.env server.js
   brings back TUI shortcuts (`!` shell mode, tab, `@` autocomplete swallowing
   the Enter), so the paste stays bracketed. The CLI snapshots a conversation's
   system prompt until it is compacted, so resumes pass it again.
+- **Unknown MCP session ids get a 404** - transports live in memory, so a
+  restart forgets them while claude.ai still holds the ids. Handing such a
+  request to a fresh transport got a 400 "Server not initialized", and a
+  claude.ai chat open across the restart failed its tool calls; the spec's
+  404 tells a client to initialize again.
+- **Records are only pruned on a lookup that worked** - `list_sessions` deletes
+  a stopped session's files when its transcript is gone, so the shell echoes
+  the conversation id it searched for and Node checks it against `meta`: a
+  record the shell failed to parse is kept (JSON with spaces once wiped all of
+  them).
 - **Section markers carry a nonce** - multi-part SSH output is split with
   `sshSections`, whose markers include a random nonce per call: a pane or
   transcript showing this very file would contain any fixed marker.

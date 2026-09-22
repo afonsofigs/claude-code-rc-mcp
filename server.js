@@ -41,7 +41,7 @@ const RC_SYSTEM_PROMPT =
   "tags: treat the text inside them as the user's own message, written by them for this session.";
 const SESSION_SYSTEM_PROMPT = [RC_SYSTEM_PROMPT, APPEND_SYSTEM_PROMPT].filter(Boolean).join("\n\n");
 const SESSION_RETENTION_DAYS = parseFloat(process.env.SESSION_RETENTION_DAYS || "14");
-const VERSION = "1.2.0";
+const VERSION = "1.2.1";
 
 const required = { MCP_SECRET, SERVER_URL, SSH_HOST, SSH_USER, SSH_PRIVATE_KEY, PROJECTS_BASE_DIR };
 const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
@@ -471,7 +471,7 @@ async function readLive(id) {
  */
 async function lastConversation(id) {
   const r = await sshExec(
-    `grep -l '"tmux":"rc-${id}:' ${CLAUDE_DIR}/sessions/*.json 2>/dev/null | ` +
+    `grep -l '"tmux": *"rc-${id}:' ${CLAUDE_DIR}/sessions/*.json 2>/dev/null | ` +
     `while read -r f; do base64 < "$f" | tr -d '\\n'; echo; done`
   );
   let newest = null;
@@ -1403,9 +1403,9 @@ function createMcpServer() {
           `P=$(tmux display -p -t "rc-$id" '#{pane_pid} #{session_created}' 2>/dev/null); ` +
           `L=$(cat ${CLAUDE_DIR}/sessions/"\${P%% *}".json 2>/dev/null | base64 | tr -d '\\n'); ` +
           `echo "ON $id \${P:-- -} \${L:--} $m \${u:--}"; ` +
-          `else sid=$(grep -o '"sessionId":"[0-9a-f-]*"' "$f" | cut -d'"' -f4); t=; ` +
+          `else sid=$(grep -o '"sessionId": *"[0-9a-f-]*"' "$f" | cut -d'"' -f4); t=; ` +
           `[ -n "$sid" ] && t=$(find ${CLAUDE_PROJECTS_DIR} -maxdepth 2 -name "$sid.jsonl" -printf '%T@\\n' 2>/dev/null | head -n 1); ` +
-          `echo "OFF $id \${t:-0} $m \${u:--}"; fi; done; ` +
+          `echo "OFF $id \${sid:--} \${t:-0} $m \${u:--}"; fi; done; ` +
           `tmux list-sessions -F '#{session_name}' 2>/dev/null | sed -n 's/^rc-/TMUX /p'`;
         const r = await sshExec(remote);
 
@@ -1426,12 +1426,16 @@ function createMcpServer() {
             sessions.push({ id, running: true, meta, live, url: live?.url || (url !== "-" ? url : null) });
             known.add(id);
           } else if (kind === "OFF") {
-            const [mtime, metaB64, url] = f;
+            const [sid, mtime, metaB64, url] = f;
             const meta = parseMeta(fromB64(metaB64));
             const lastActive = parseFloat(mtime) * 1000;
             known.add(id);
             // Only a conversation whose transcript still exists can come back.
-            if (meta?.mode !== "session" || !lastActive || Date.now() - lastActive > retentionMs) {
+            // "No transcript" only counts when the lookup searched for the id
+            // the record holds: files are deleted on it, so a record the shell
+            // could not read is kept rather than taken for a dead one.
+            const searched = sid === metaSessionId(meta);
+            if (meta?.mode !== "session" || (searched && (!lastActive || Date.now() - lastActive > retentionMs))) {
               stale.push(id);
               continue;
             }
@@ -1457,7 +1461,7 @@ function createMcpServer() {
             const kind = s.meta?.mode === "session" ? "conversational" : s.meta?.mode === "server" ? "remote-control server" : "no metadata";
             const state = s.running
               ? (s.meta?.mode === "session" ? status(s.live) : "running")
-              : `not running (last active ${ago(s.lastActive)} ago), resumable`;
+              : `not running${s.lastActive ? ` (last active ${ago(s.lastActive)} ago)` : ""}, resumable`;
             return `• ${s.id}  -  ${kind} · ${state}${s.url ? `\n    ${s.url}` : ""}`;
           })
           .join("\n");
@@ -1560,6 +1564,16 @@ app.use(mcpAuthRouter({
 
 const transports = new Map();
 
+/**
+ * Sessions live in memory, so a restart forgets every one of them while the
+ * clients still hold their ids. The spec's answer is 404, which tells a
+ * client to initialize a new session. Handing the request to a fresh
+ * transport instead gets a 400 "Server not initialized", and a claude.ai chat
+ * that was open across the restart then fails its tool calls outright.
+ */
+const unknownSession = (res) =>
+  res.status(404).json({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null });
+
 const authMiddleware = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -1579,6 +1593,8 @@ app.post("/mcp", authMiddleware, async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
     if (sessionId && transports.has(sessionId)) {
       await transports.get(sessionId).handleRequest(req, res, req.body);
+    } else if (sessionId) {
+      unknownSession(res);
     } else {
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
@@ -1602,9 +1618,8 @@ app.post("/mcp", authMiddleware, async (req, res) => {
 
 app.get("/mcp", authMiddleware, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
-  if (!sessionId || !transports.has(sessionId)) {
-    return res.status(400).json({ error: "Missing or invalid session ID" });
-  }
+  if (!sessionId) return res.status(400).json({ error: "Missing session ID" });
+  if (!transports.has(sessionId)) return unknownSession(res);
   await transports.get(sessionId).handleRequest(req, res);
 });
 
