@@ -1,6 +1,6 @@
 {
   "name": "claude-code-rc-mcp",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Self-hosted MCP server that launches Claude Code Remote Control sessions on a remote dev server over SSH",
   "type": "module",
   "main": "server.js",

@@ -3,9 +3,10 @@
 ## What is this?
 
 A self-hosted MCP server that launches `claude remote-control` sessions on a remote
-development server over SSH, and holds conversations with them. Six tools:
-`start_session`, `send_prompt`, `get_reply`, `list_sessions`, `stop_session`,
-`list_projects`. Protected by OAuth 2.1 with credentials derived from `MCP_SECRET`.
+development server over SSH, and holds conversations with them. Eight tools:
+`start_session`, `send_prompt`, `get_reply`, `interrupt_session`, `resume_session`,
+`list_sessions`, `stop_session`, `list_projects`. Protected by OAuth 2.1 with
+credentials derived from `MCP_SECRET`.
 
 ## Stack
 
@@ -38,8 +39,15 @@ node --env-file=.env server.js
   reaches the dev server over SSH, which keeps it portable to any host (VM,
   bare-metal, pod with sshd), not just Kubernetes.
 - **tmux workaround** — `claude remote-control` requires a TTY and has no headless
-  mode. Each session runs as `claude remote-control … 2>&1 | tee /tmp/rc-<id>.log`
+  mode. Each session runs as `claude remote-control … 2>&1 | tee <state>/<id>.log`
   inside a detached `tmux` session named `rc-<id>`.
+- **State on the home volume, not /tmp** - per-session files live in
+  `~/.claude-rc-mcp/<id>.{meta,url,log,prompt,sys,send,pending,tr}` on the dev
+  server (`<state>` below). A container restart wipes /tmp, and the transcripts
+  under `~/.claude` survive it, so the pointer to them has to survive too:
+  `meta` (mode, dir, name, conversation id, bypass) is what a resume relaunches
+  from. The directory is resolved to an absolute path once per process
+  (`stateDir()`) so it interpolates like a literal.
 - **Two launch shapes** — `claude remote-control` takes no initial prompt (its
   usage is `[options]` only). So when `start_session` is given a `prompt`, it
   launches `claude --rc <name> "<prompt>"` instead (`--rc` is the short form of
@@ -51,7 +59,7 @@ node --env-file=.env server.js
   `--spawn`, which exists only on the server form, so `worktree` is ignored
   there. The session stays open after the task completes.
 - **Prompt never touches a shell parser** — it is base64-encoded in Node,
-  decoded into `/tmp/rc-<id>.prompt` on the server, and read back inside the
+  decoded into `<state>/<id>.prompt` on the server, and read back inside the
   tmux command as `"$(cat …)"`. That is why prompts can hold quotes, `$(…)`,
   backticks and newlines without any escaping logic, and why the `NAME_RE`-style
   validation used for `name`/`path`/`id` is not needed for it.
@@ -65,14 +73,17 @@ node --env-file=.env server.js
   mangled URL (a dropped character); `tmux capture-pane` renders it correctly.
   The Remote Control server is the mirror image: its `tee` log is clean line
   output, while its pane wraps the (longer) environment URL across two rows.
-  Hence `pollSession({fromPane})` — pane first for prompt mode only. The
-  resolved URL is then written to `/tmp/rc-<id>.url` so `list_sessions` reports
-  exactly what `start_session` returned instead of re-parsing the log.
-- **Sessions auto-terminate** — because the pane runs the `claude | tee` pipeline
-  directly, the `tmux` session ends when `claude` exits. So `list_sessions` only
-  ever shows live sessions; there are no zombie tmux sessions to reap. The scratch
-  files outlive the session, so `list_sessions` lazily deletes the orphan
-  `/tmp/rc-<id>.{log,prompt,url,meta,tr,pending,send}` set.
+  Hence `pollSession({fromPane})` - pane first for prompt mode only. Both are
+  fallbacks now: the status file (below) names the Remote Control session
+  outright, and it is the only source trusted after a resume, whose pane and log
+  redraw a history that may contain other session links. The resolved URL is
+  written to `<state>/<id>.url` so `list_sessions` reports it without re-parsing.
+- **Sessions auto-terminate, records do not** - because the pane runs `claude`
+  directly, the `tmux` session ends when `claude` exits: no zombie tmux sessions.
+  The record in `<state>` stays, and `list_sessions` shows the session as not
+  running and resumable until `SESSION_RETENTION_DAYS` after its transcript was
+  last written, then deletes its files. A server-mode record, or one whose
+  transcript is gone, is deleted as soon as its session is not running.
 - **Logfile, not `capture-pane`, for diagnostics** — `start_session` polls the
   logfile, which survives even if the session dies on a startup error;
   `capture-pane` would not. (`capture-pane` is used only to read the URL of a
@@ -87,11 +98,36 @@ node --env-file=.env server.js
   and tool_use arrive as separate entries, so a text-only entry can still be the
   prelude to a tool call. Sidechain (sub-agent) entries are skipped: they finish
   mid-turn and would otherwise read as the answer.
-- **Transcript found by mtime, not by slugifying the path** — the slug escaping
-  rules belong to the CLI. `/tmp/rc-<id>.meta` is written immediately before
-  `tmux new-session`, so its mtime is the cutoff: the session's transcript is
-  the newest `.jsonl` touched after it whose recorded `cwd` is the project dir.
-  Cached in `/tmp/rc-<id>.tr`.
+- **Conversation id chosen here, transcript found by name** - `start_session`
+  passes `--session-id <uuid>` and records it, so the transcript is
+  `~/.claude/projects/*/<uuid>.jsonl` without reconstructing the CLI's slug
+  rules. Cached in `<state>/<id>.tr`, trusted only while it names that id.
+- **The CLI's status file is the live signal** - Claude Code keeps
+  `~/.claude/sessions/<pid>.json` per process, and in conversational mode the
+  pane pid is claude's. It gives `status` (`busy`, `idle`, `shell` = idle with a
+  background shell, `waiting` + `waitingFor` for a question, approval prompt or
+  dialog), the current conversation id (a `/clear` changes it, and moves to a new
+  transcript file), and `bridgeSessionId` (the session URL). Pids repeat across
+  container restarts and a killed process leaves its file behind, so a file whose
+  `startedAt` predates the tmux session is ignored (`parseLive`). A process that
+  exits cleanly deletes its file, so the conversation id is copied into `meta`
+  wherever the status is read (`followConversation`); after a crash, the
+  newest file naming the tmux session says which conversation it was last in
+  (`lastConversation`), including a `/clear` nothing here saw.
+- **Command output ends a turn too** - a slash command gets no assistant
+  message: `/compact` ends on a user entry `<local-command-stdout>…`, dialog
+  commands (`/model`, `/cost`) log `system`/`local_command` entries instead, and
+  `/clear` writes its entries into the new transcript. Waiting for an assistant
+  reply there is what made `/compact` look like it never finished. An Esc ends a
+  turn on `[Request interrupted by user]`. Meta user entries (command caveats,
+  the "Continue from where you left off." a resume injects) and the synthetic
+  "No response requested." after it are not part of a turn; synthetic API errors
+  are, since they are how a failed turn ends.
+- **Idle without an ending means cut short** - the status file is read before
+  the transcript on each poll, and the CLI writes a turn's last entry before it
+  flips to idle. So idle, a status change after the turn started, and no ending
+  in the transcript is a turn that was cut off (typically by the restart a resume
+  recovers from), reported as such instead of "still working" forever.
 - **`paste-buffer`, not `send-keys`, for the prompt** — `send-keys` would turn
   every newline of a multi-line prompt into a submit and replay a long prompt
   keystroke by keystroke. `paste-buffer -p` wraps it in bracketed-paste markers
@@ -99,18 +135,44 @@ node --env-file=.env server.js
 - **The reply is anchored on the prompt, not the clock** — a turn that was
   already running when the prompt was pasted also finishes *after* the send
   mark, and its answer is not the one that was asked for. So the turn starts at
-  the last non-`tool_result` user entry after the mark; no such entry means the
-  prompt is still queued, not that there is nothing to report.
+  the last input entry after the mark (a prompt or a slash command, not a
+  `tool_result` nor a command's output); no such entry means the prompt has not
+  been picked up yet, not that there is nothing to report.
+- **One turn at a time: interrupt, then send** - a prompt pasted into a busy
+  session never becomes a user entry: the CLI folds it into the running turn as
+  a `queued_command` attachment, so the anchor never appears. A dialog would
+  swallow the paste. So `send_prompt` presses Esc first when the status is
+  `busy` or `waiting` (`interruptTurn`), once, and again only if it plainly did
+  not take after 4s, because a second Esc on an idle prompt opens the rewind
+  menu.
+- **Not running is recoverable** - `send_prompt` / `get_reply` resume a stopped
+  conversational session first (`openConversation`): `claude --rc <name>
+  --resume <uuid>` in a tmux session of the same name, so the id and even the
+  claude.ai/code URL stay the same. A resumed session that opens on a dialog is
+  reported, not Esc'd.
+- **System prompt on every launch** - `--append-system-prompt` carries a fixed
+  note (`RC_SYSTEM_PROMPT`) plus `APPEND_SYSTEM_PROMPT`. The note exists because
+  a bracketed paste reaches the model wrapped in `<pasted_content>` tags, which
+  Claude Code's own system prompt says to distrust unless the user's own message
+  vouches for them; a prompt from here is nothing but that, and was refused once
+  right after a `/clear`. A raw paste avoids the tags only below ~800 bytes and
+  brings back TUI shortcuts (`!` shell mode, tab, `@` autocomplete swallowing
+  the Enter), so the paste stays bracketed. The CLI snapshots a conversation's
+  system prompt until it is compacted, so resumes pass it again.
+- **Section markers carry a nonce** - multi-part SSH output is split with
+  `sshSections`, whose markers include a random nonce per call: a pane or
+  transcript showing this very file would contain any fixed marker.
 - **The send mark is stamped by the remote host** — it is compared against
   timestamps written by the session, so a container clock a few seconds ahead of
   the dev server would place it in their future and the reply would never be
   recognised. `date -u` on the server, echoed back over SSH.
-- **Approval prompts are reported, not waited out** — without
-  `bypass_permissions` a session stalls mid-turn on the tool-approval box and
-  never reaches a final answer, so `send_prompt`/`get_reply` detect the box in
-  the pane and return it (with the session URL) instead of burning the timeout.
-  The detection regex wants the question *and* the numbered list that follows,
-  including the box-drawing characters `capture-pane` renders around them.
+- **Questions and approval prompts are reported, not waited out** - a session
+  stalls mid-turn on the tool-approval box (without `bypass_permissions`) or on
+  an `AskUserQuestion`, so `send_prompt`/`get_reply` report the status file's
+  `waiting` (with the session URL and pane) instead of burning the timeout. When
+  the status file cannot be read, a regex on the pane is the fallback: it wants
+  the question *and* the numbered list that follows, including the box-drawing
+  characters `capture-pane` renders around them.
 - **Unique session ids** — `start_session` appends a random suffix
   (`rc-<name>-<random>`) so reusing the same `name` never collides.
 - **OAuth 2.1 file-persisted** — tokens stored in `TOKEN_STORE_PATH` via `TokenStore`.
@@ -149,6 +211,16 @@ In `OAuthProvider.exchangeAuthorizationCode()`, change `expiresIn` (default 8640
 curl http://localhost:3000/health
 curl http://localhost:3000/.well-known/oauth-authorization-server
 ```
+
+To exercise the tools end to end, run the server against the dev server with a
+pre-seeded `TOKEN_STORE_PATH` (`{"tokens":{"t":{"clientId":"x","scopes":[],"expiresAt":9999999999999}},"codes":{}}`)
+and call it with the SDK's `Client` + `StreamableHTTPClientTransport`, passing
+`Authorization: Bearer t`. Point `CLAUDE_BIN` at a wrapper that does
+`exec claude --model haiku "$@"` to keep turns cheap, and use a throwaway
+project, trusted once by hand (the trust dialog blocks a fresh directory). A
+test project gets auto-memory like any other, so "remember X" style checks leak
+across its sessions. Never interrupt or stop the session you are running in:
+it is an `rc-*` tmux session too.
 
 ## CI/CD
 

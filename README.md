@@ -6,7 +6,7 @@ Self-hosted [MCP](https://modelcontextprotocol.io/) server that launches **[Clau
 
 `claude remote-control` needs an interactive terminal (TTY) on the server. Without this MCP you have to SSH in by hand, start `tmux`, run the command, and only then connect from the app. With it, you just ask Claude.ai *"start a Claude Code session in project X"* and the MCP does the rest.
 
-Sessions are **ephemeral by design**: created on demand, alive while in use, gone when finished. The only permanent component is this lightweight MCP server itself.
+Sessions are created on demand and live while in use. When one stops (a dev server restart, a crash, `stop_session`), its conversation is kept, and the next `send_prompt` or `get_reply` brings it back as it was. The only permanent component is this lightweight MCP server itself.
 
 ## How it works
 
@@ -34,12 +34,14 @@ The Remote Control connection itself is **outbound-only** (the server connects t
 
 ## Features
 
-- **6 tools**: `start_session`, `send_prompt`, `get_reply`, `list_sessions`, `stop_session`, `list_projects`
+- **8 tools**: `start_session`, `send_prompt`, `get_reply`, `interrupt_session`, `resume_session`, `list_sessions`, `stop_session`, `list_projects`
 - **Two-way**: prompt a session that is already running and get its final answer back, without leaving the chat
+- **Resumable**: sessions that stopped (dev server restart, crash) are listed and picked up again with their full conversation, under the same id and URL
+- **Session system prompt**: `APPEND_SYSTEM_PROMPT` adds house rules to every conversational session, e.g. "never use interactive widgets"
 - **OAuth 2.1**: fixed client credentials derived from `MCP_SECRET` — no separate user database
 - **Persistent OAuth tokens**: issued tokens are written to disk so they survive container/pod restarts
 - **Streamable HTTP**: `/mcp` endpoint for remote MCP connections
-- **Stateless**: all session state lives in `tmux` on the remote server, so the MCP can be restarted or scaled freely
+- **Stateless**: all session state lives on the remote server (`tmux`, plus `~/.claude-rc-mcp`), so the MCP can be restarted or scaled freely
 - **Docker**: ready to deploy on Kubernetes, Fly.io, Railway, etc.
 
 ## MCP Tools
@@ -63,11 +65,13 @@ The `tmux` session is named `rc-<name>-<random>`; the random suffix avoids colli
 
 > *"Start a session on `my-project` and run `/security-review`"* → the review is already running by the time you open the link.
 
-The prompt is never interpolated into a shell command: it is base64-encoded, decoded into `/tmp/rc-<id>.prompt` on the server, and read back with `"$(cat …)"`, so no part of it reaches a shell parser.
+The prompt is never interpolated into a shell command: it is base64-encoded, decoded into `~/.claude-rc-mcp/<id>.prompt` on the server, and read back with `"$(cat …)"`, so no part of it reaches a shell parser.
+
+Conversational sessions also get `--append-system-prompt` with a short note from this server (see [Session system prompt](#session-system-prompt)) followed by `APPEND_SYSTEM_PROMPT`, and `--session-id` with a conversation id chosen here, which is how their transcript is found and how they are resumed later.
 
 ### `send_prompt`
 
-Sends a follow-up prompt to a conversational session that is already running, and returns its **final answer** — so you can hold a whole conversation with a remote session from Claude.ai, not just start one.
+Sends a follow-up prompt to a conversational session, and returns its **final answer** - so you can hold a whole conversation with a remote session from Claude.ai, not just start one.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -76,6 +80,11 @@ Sends a follow-up prompt to a conversational session that is already running, an
 | `wait_seconds` | number | No | How long to wait for the answer before returning (default `90`, max `240`) |
 
 The prompt is typed into the live conversation, so the session keeps its full context and the exchange stays visible at claude.ai/code. Turns that outlast `wait_seconds` are not lost — the call returns "still working" and [`get_reply`](#get_reply) collects the answer afterwards.
+
+Two things happen first when needed:
+
+- **The session is not running** (it shows as *not running* in `list_sessions`): it is resumed, with its conversation, before the prompt goes in.
+- **The session is busy** with a previous turn, or has a question, approval prompt or dialog open: that is interrupted with Esc first. One turn at a time. A prompt pasted into a running turn is folded into it as a queued attachment, so it would never get an answer of its own, and a dialog would swallow the paste.
 
 Only conversational sessions accept it; against a Remote Control *server* session it returns an explanatory error, because that process spawns its sessions as separate children and has no conversation of its own.
 
@@ -86,30 +95,61 @@ Only conversational sessions accept it; against a Remote Control *server* sessio
 | `id` | string | Yes | Full session id |
 | `wait_seconds` | number | No | How long to wait if the turn is still running (default `90`, max `240`, `0` to peek) |
 
-Collects the final answer of the session's current turn: the reply to the last `send_prompt`, or — if no prompt was ever sent through the MCP — the reply to the `prompt` the session was started with. That second case is the useful one for *"start a session on X and run the tests"*: come back later and read the result.
+Collects the final answer of the session's current turn: the reply to the last `send_prompt`, or - if no prompt was ever sent through the MCP - the reply to the `prompt` the session was started with. That second case is the useful one for *"start a session on X and run the tests"*: come back later and read the result. A session that is not running is resumed first.
+
+Besides an answer, it can report that the turn ran a slash command (with the command's output, e.g. `/compact`), was interrupted, ended with an API error, was cut short (the session stopped mid-turn, e.g. a server restart), or is waiting on a question, approval prompt or dialog.
 
 #### How the answer is read back
 
-Not by scraping the terminal. Claude Code writes every conversation to a JSONL transcript under `~/.claude/projects/<project>/<uuid>.jsonl`, and each assistant entry carries an explicit `stop_reason` — so the end of a turn is a fact to be read, not a guess about whether the pane has stopped changing. The reply comes out as clean text: no ANSI escapes, no box-drawing, nothing truncated to the terminal width.
+Not by scraping the terminal. Claude Code writes every conversation to a JSONL transcript under `~/.claude/projects/<project>/<uuid>.jsonl`, and each assistant entry carries an explicit `stop_reason` - so the end of a turn is a fact to be read, not a guess about whether the pane has stopped changing. The reply comes out as clean text: no ANSI escapes, no box-drawing, nothing truncated to the terminal width. Slash commands such as `/compact` or `/model` end differently: with no assistant message at all, on an entry holding the command's output.
 
-The transcript is located by mtime rather than by rebuilding the CLI's directory-slug rules: `/tmp/rc-<id>.meta` is written immediately before `tmux` launches the session, so the session's transcript is the newest `.jsonl` touched after that whose recorded `cwd` is the project directory. The path is then cached in `/tmp/rc-<id>.tr`.
+The transcript is found by name: `start_session` picks the conversation id itself (`--session-id`), so there is no directory-slug to rebuild. A `/clear` moves the session on to a new conversation. That is tracked through the small status file Claude Code keeps per process (`~/.claude/sessions/<pid>.json`), which also says whether the session is busy, idle, or waiting on a dialog.
 
 Two things follow from this that are worth knowing:
 
-- **Approval prompts block the turn.** A session running without `bypass_permissions` stops mid-turn on the tool-approval box and never reaches a final answer. `send_prompt` and `get_reply` detect it and say so — with the session URL — instead of waiting out the timeout. Sessions you intend to drive this way are best started with `bypass_permissions`.
-- **The reply is anchored to the prompt, not to the clock.** If the session was already working when the prompt arrived, that prompt queues up, and the older turn's answer — which also lands after the prompt was sent — is not mistaken for it.
+- **Questions and approval prompts block the turn.** A session running without `bypass_permissions` stops mid-turn on the tool-approval box, and one that uses `AskUserQuestion` stops on the question, so neither reaches a final answer. `send_prompt` and `get_reply` detect it and say so, with the session URL, instead of waiting out the timeout. Answer it at claude.ai/code, or dismiss it with `interrupt_session`. Sessions you intend to drive this way are best started with `bypass_permissions`, and told through `APPEND_SYSTEM_PROMPT` to ask their questions in plain text.
+- **The reply is anchored to the prompt, not to the clock.** An older turn's answer, which may also land after the prompt was sent, is not mistaken for it.
+
+### `interrupt_session`
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | Yes | Full session id |
+
+Stops what the session is doing right now, like pressing Esc or the stop button: a running turn, or an open question, approval prompt or dialog. The session stays open with its context, ready for the next `send_prompt`.
+
+### `resume_session`
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | Yes | Full session id from `list_sessions` |
+| `bypass_permissions` | boolean | No | Override the permission mode the session was started with. Omitted, it is kept |
+
+Relaunches a conversational session that is no longer running as `claude --rc <name> --resume <conversation>`, in the same `tmux` session name, so the id stays the same, and so does the claude.ai/code URL. `send_prompt` and `get_reply` do this on their own; this tool is for when you only want the session back.
+
+This works because the per-session state lives in `~/.claude-rc-mcp/` on the dev server, next to the transcripts under `~/.claude`, instead of `/tmp`, which a container restart wipes. After a crash the conversation to reopen is taken from the status file the dead process left behind, which followed any `/clear` typed at claude.ai/code.
 
 ### `list_sessions`
 
-Lists the active `rc-*` `tmux` sessions with their URLs (read from `/tmp/rc-<id>.url`, written by `start_session`) and their mode, so you can tell which ones accept `send_prompt`. Also cleans up the orphan `/tmp/rc-<id>.*` files left by sessions that already ended.
+Lists the sessions with their URLs and mode, so you can tell which ones accept `send_prompt`: the running ones, and whether each is working, idle or waiting for input, and the conversational ones that are no longer running, with how long ago they were last active. Those stay listed, and resumable, for `SESSION_RETENTION_DAYS` (default 14) after their last activity, then their files are removed.
 
 ### `stop_session`
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | Yes | Full session id from `start_session` / `list_sessions` (e.g. `my-project-a1b2c3`) |
+| `forget` | boolean | No | Also drop the session from `list_sessions`, so it can no longer be resumed from here |
 
-Kills the `tmux` session and removes its `/tmp/rc-<id>.*` files.
+Kills the `tmux` session. The conversation is kept, so the session can be resumed later, unless `forget` is set, which also removes its `~/.claude-rc-mcp/<id>.*` files.
+
+## Session system prompt
+
+Every conversational session is launched with `--append-system-prompt`, and so is every resume:
+
+1. **A fixed note from this server.** `send_prompt` types prompts in as a bracketed paste, and Claude Code wraps pasted text in `<pasted_content>` tags while its own system prompt tells the model to follow instructions in those only when the user's own message asks for it. A prompt sent from here is nothing but pasted text, so a session can refuse it outright (seen right after a `/clear`). The note tells the model those tags carry the user's own messages in this session. Text pasted at claude.ai/code arrives as a plain message, so it is unaffected.
+2. **`APPEND_SYSTEM_PROMPT`**, if set: your own rules for sessions driven remotely. The typical one is to never use interactive widgets such as `AskUserQuestion`, which cannot be answered through this MCP, and to ask questions in plain text instead.
+
+Claude Code records a conversation's system prompt on its first request and replays that record until the conversation is compacted, so a change to `APPEND_SYSTEM_PROMPT` reaches existing conversations after their next `/compact` (or a `/clear`).
 
 ### `list_projects`
 
@@ -129,6 +169,8 @@ Lists directories under `PROJECTS_BASE_DIR` that look like projects (contain a `
 | `SSH_PASSPHRASE` | No | Passphrase for an encrypted SSH key |
 | `CLAUDE_BIN` | No | `claude` binary on the server; set to an absolute path if not on the non-interactive SSH `PATH` (default: `claude`) |
 | `SPAWN_WORKTREE` | No | Boolean (default `false`). Default for the per-call `worktree` input |
+| `APPEND_SYSTEM_PROMPT` | No | Text appended to the system prompt of every conversational session, resumed ones included (see [Session system prompt](#session-system-prompt)) |
+| `SESSION_RETENTION_DAYS` | No | How long a session that is no longer running stays listed and resumable, counted from its last activity (default: `14`) |
 | `TOKEN_STORE_PATH` | No | Where issued OAuth tokens are persisted (default: `/data/oauth-tokens.json`) |
 | `PORT` | No | Server port (default: `3000`) |
 

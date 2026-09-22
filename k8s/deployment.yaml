@@ -20,6 +20,12 @@ stringData:
   PROJECTS_BASE_DIR: "/home/youruser/projects"
   CLAUDE_BIN: "claude"
   SPAWN_WORKTREE: "false"
+  # Optional: house rules appended to the system prompt of conversational sessions.
+  APPEND_SYSTEM_PROMPT: >-
+    Never use AskUserQuestion or any other interactive widget: they cannot be
+    answered in this session. When you need a decision or clarification, write
+    the questions out in your reply, numbered, with the options and your
+    recommendation, and end the turn to wait for a text answer.
   SSH_PRIVATE_KEY: |
     -----BEGIN OPENSSH PRIVATE KEY-----
     REPLACE WITH THE FULL PRIVATE KEY CONTENT
