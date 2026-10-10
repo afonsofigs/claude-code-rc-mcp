@@ -213,6 +213,7 @@ docker run -d \
 ### Run with Node.js
 
 ```bash
+# Node.js 24 (see .nvmrc)
 git clone https://github.com/afonsofigs/claude-code-rc-mcp.git
 cd claude-code-rc-mcp
 npm install

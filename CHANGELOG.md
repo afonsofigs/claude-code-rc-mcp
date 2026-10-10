@@ -15,6 +15,7 @@
 - Folder trust: `start_session` (and any resume) checks Claude Code's own trust rule first and launches nothing in an untrusted folder, saying what trusting it implies. `trust_folder: true`, only on the user's explicit request, answers the trust dialog in the terminal.
 - Startup dialogs (the folder trust dialog, or any other before the session starts) are reported as such by every tool, never as "still working"; `send_prompt` and `interrupt_session` refuse to press keys there.
 - Quality gates: `npm run verify` (`node --check`, ESLint, `node:test` unit tests), also run in CI before the image is built. `npm run e2e` checks every tool against a local instance.
+- The project's Node.js version is pinned to 24, the image's (`.nvmrc`, read by CI; `engines`).
 
 ### Removed
 

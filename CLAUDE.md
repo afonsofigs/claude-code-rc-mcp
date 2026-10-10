@@ -10,7 +10,7 @@ credentials derived from `MCP_SECRET`.
 
 ## Stack
 
-- Node.js (ESM), single file: `server.js` (importable: it only exits on missing
+- Node.js 24 (ESM; `.nvmrc`, same as the image and CI), single file: `server.js` (importable: it only exits on missing
   config and listens when run as the entry point, so the tests can load it)
 - `@modelcontextprotocol/sdk` — MCP protocol, OAuth handlers, Streamable HTTP transport
 - `ssh2` — SSH client

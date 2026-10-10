@@ -4,11 +4,14 @@
   "description": "Self-hosted MCP server that launches Claude Code Remote Control sessions on a remote dev server over SSH",
   "type": "module",
   "main": "server.js",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js",
     "lint": "eslint .",
-    "test": "node --test test/",
+    "test": "node --test",
     "verify": "npm run check && npm run lint && npm test",
     "e2e": "node scripts/e2e.mjs"
   },
