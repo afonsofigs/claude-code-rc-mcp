@@ -4,9 +4,9 @@ Self-hosted [MCP](https://modelcontextprotocol.io/) server that launches **[Clau
 
 ## Why?
 
-`claude remote-control` needs an interactive terminal (TTY) on the server. Without this MCP you have to SSH in by hand, start `tmux`, run the command, and only then connect from the app. With it, you just ask Claude.ai *"start a Claude Code session in project X"* and the MCP does the rest.
+A Claude Code session with Remote Control (`claude --rc`) needs an interactive terminal (TTY) on the server. Without this MCP you have to SSH in by hand, start `tmux`, run the command, and only then connect from the app. With it, you just ask Claude.ai *"start a Claude Code session in project X"* and the MCP does the rest.
 
-Sessions are created on demand and live while in use. When one stops (a dev server restart, a crash, `stop_session`), its conversation is kept, and the next `send_prompt` or `get_reply` brings it back as it was. The only permanent component is this lightweight MCP server itself.
+Sessions are created on demand and live while in use. When one stops (a dev server restart, a crash, `disconnect_session`), its conversation is kept, and the next `send_prompt` or `get_reply` brings it back as it was. `stop_session` closes one for good: ended, archived at claude.ai/code, and forgotten here. The only permanent component is this lightweight MCP server itself.
 
 ## How it works
 
@@ -19,7 +19,7 @@ Claude.ai / Mobile app / Scheduled tasks
         v  SSH (key-based auth)
   Remote dev server with Claude Code installed
         |
-        v  tmux new-session -d 'claude remote-control'
+        v  tmux new-session -d 'claude --rc <name>'
   Remote Control session (ephemeral)
         |
         v  the session phones home to the Anthropic API
@@ -30,13 +30,14 @@ Once a conversational session is up, `send_prompt` / `get_reply` drive it over t
 
 The Remote Control connection itself is **outbound-only** (the server connects to the Anthropic API; no inbound ports). SSH is only the channel this MCP uses to *launch* the process.
 
-> **Note on `tmux`.** `claude remote-control` still requires a TTY — there is no `--headless`/`--daemon` mode yet. Running it inside a detached `tmux` session provides the TTY, survives the SSH connection closing, and gives `list`/`kill` of sessions for free. When a headless mode lands, the `tmux` layer can be dropped.
+> **Note on `tmux`.** `claude --rc` still requires a TTY — there is no `--headless`/`--daemon` mode yet. Running it inside a detached `tmux` session provides the TTY, survives the SSH connection closing, and gives `list`/`kill` of sessions for free. When a headless mode lands, the `tmux` layer can be dropped.
 
 ## Features
 
-- **8 tools**: `start_session`, `send_prompt`, `get_reply`, `interrupt_session`, `resume_session`, `list_sessions`, `stop_session`, `list_projects`
+- **9 tools**: `start_session`, `send_prompt`, `get_reply`, `interrupt_session`, `resume_session`, `list_sessions`, `disconnect_session`, `stop_session`, `list_projects`
 - **Two-way**: prompt a session that is already running and get its final answer back, without leaving the chat
-- **Resumable**: sessions that stopped (dev server restart, crash) are listed and picked up again with their full conversation, under the same id and URL
+- **Resumable**: sessions that stopped (dev server restart, crash, `disconnect_session`) are listed and picked up again with their full conversation, under the same id and URL
+- **Closed means archived**: `stop_session` and `disconnect_session` end the process cleanly, so claude.ai/code archives the session, and report the archive as Claude Code itself logged it
 - **Session system prompt**: `APPEND_SYSTEM_PROMPT` adds house rules to every conversational session, e.g. "never use interactive widgets"
 - **OAuth 2.1**: fixed client credentials derived from `MCP_SECRET` — no separate user database
 - **Persistent OAuth tokens**: issued tokens are written to disk so they survive container/pod restarts
@@ -55,19 +56,24 @@ SSHes to the server and launches Claude Code Remote Control inside a detached `t
 | `name` | string | Yes | Short label, shown in claude.ai/code (1-41 chars, `[a-zA-Z0-9_-]`) |
 | `path` | string | Yes | Project directory, relative to `PROJECTS_BASE_DIR` |
 | `prompt` | string | No | Initial prompt or slash command to run as soon as the session opens |
-| `interactive` | boolean | No | Open an empty conversational session, ready for `send_prompt`. Implied by `prompt` |
-| `worktree` | boolean | No | Spawn on-demand work in isolated git worktrees. Defaults to `SPAWN_WORKTREE`. Ignored for conversational sessions |
+| `interactive` | boolean | No | Deprecated and ignored: every session is conversational, empty unless `prompt` is given. Removed in the next version |
+| `worktree` | boolean | No | Deprecated and ignored: it applied to the Remote Control server form, no longer launched. Removed in the next version |
 | `bypass_permissions` | boolean | No | Launch with `--dangerously-skip-permissions`, so the session never waits for tool approvals |
+| `trust_folder` | boolean | No | Answer Claude Code's folder trust dialog with "Yes, I trust this folder" if it opens. Only when the user explicitly trusts that folder. Conversational sessions only |
 
 The `tmux` session is named `rc-<name>-<random>`; the random suffix avoids collisions when the same `name` is reused.
 
-**Two launch modes.** Plain, the session is the persistent Remote Control *server* (`claude remote-control`) — it accepts multiple concurrent sessions and honours `--spawn`. With `prompt` or `interactive`, it is a single **conversational** session started as `claude --rc <name> ["<prompt>"]`: the only form that takes an initial instruction, and the only one you can send further prompts to. `worktree`/spawn does not apply there. Either way the session stays open when the task finishes, so you can pick it up from claude.ai/code:
+**One launch shape.** Every session is a single **conversational** session, started as `claude --rc <name> ["<prompt>"]`. Without a `prompt` it opens empty: *"open me an RC session on `my-project`"* gives you a URL to go and use it at claude.ai/code, and it can also be driven from here with `send_prompt`. With a `prompt` it starts working right away, and stays open when the task finishes, so you can pick it up from claude.ai/code:
 
 > *"Start a session on `my-project` and run `/security-review`"* → the review is already running by the time you open the link.
 
+The persistent Remote Control *server* form (`claude remote-control`, with `--spawn`) is no longer launched: Claude Code keeps a server's environment on shutdown and never archives its sessions, so it could not be closed cleanly. Server sessions recorded by an older version are still listed and can be closed with `stop_session`.
+
 The prompt is never interpolated into a shell command: it is base64-encoded, decoded into `~/.claude-rc-mcp/<id>.prompt` on the server, and read back with `"$(cat …)"`, so no part of it reaches a shell parser.
 
-Conversational sessions also get `--append-system-prompt` with a short note from this server (see [Session system prompt](#session-system-prompt)) followed by `APPEND_SYSTEM_PROMPT`, and `--session-id` with a conversation id chosen here, which is how their transcript is found and how they are resumed later.
+Conversational sessions also get `--append-system-prompt` with a short note from this server (see [Session system prompt](#session-system-prompt)) followed by `APPEND_SYSTEM_PROMPT`, `--session-id` with a conversation id chosen here, which is how their transcript is found and how they are resumed later, and `--debug-file ~/.claude-rc-mcp/<id>.debug`, the only place where Claude Code records whether claude.ai/code archived the session when it ended.
+
+**Folder trust.** Claude Code asks whether you trust a project folder the first time it opens there, and nothing else happens until that is answered: no status, no Remote Control, no URL - `--dangerously-skip-permissions` does not skip it. Inside a git repository only the repository root (or a folder below it) counts, so a trusted parent folder does not cover the repositories under it. `start_session` checks this first, by Claude Code's own rule, and refuses an untrusted folder without launching anything. With `trust_folder: true` it launches anyway and answers the dialog in the terminal - moving the selection off the default "No, exit", reading it back, then confirming - so Claude Code records the trust itself. Trusting a folder lets its hooks, `.mcp.json` servers and settings run without review, from then on, in every session on the server: set it only when the user explicitly says they trust that folder. A session that is stuck on the trust dialog, or on any other dialog before it starts, is reported as such by every tool, and `send_prompt` / `interrupt_session` refuse to press keys there (Enter would pick "No, exit", Esc exits too).
 
 ### `send_prompt`
 
@@ -86,7 +92,7 @@ Two things happen first when needed:
 - **The session is not running** (it shows as *not running* in `list_sessions`): it is resumed, with its conversation, before the prompt goes in.
 - **The session is busy** with a previous turn, or has a question, approval prompt or dialog open: that is interrupted with Esc first. One turn at a time. A prompt pasted into a running turn is folded into it as a queued attachment, so it would never get an answer of its own, and a dialog would swallow the paste.
 
-Only conversational sessions accept it; against a Remote Control *server* session it returns an explanatory error, because that process spawns its sessions as separate children and has no conversation of its own.
+Every session `start_session` opens accepts it. Against a legacy Remote Control *server* session, from an older version, it returns an explanatory error: that process spawns its sessions as separate children and has no conversation of its own.
 
 ### `get_reply`
 
@@ -131,16 +137,23 @@ This works because the per-session state lives in `~/.claude-rc-mcp/` on the dev
 
 ### `list_sessions`
 
-Lists the sessions with their URLs and mode, so you can tell which ones accept `send_prompt`: the running ones, and whether each is working, idle or waiting for input, and the conversational ones that are no longer running, with how long ago they were last active. Those stay listed, and resumable, for `SESSION_RETENTION_DAYS` (default 14) after their last activity, then their files are removed.
+Lists the sessions with their URLs and mode, so you can tell which ones accept `send_prompt`: the running ones, and whether each is working, idle, waiting for input or stuck on a startup dialog, and the conversational ones that are no longer running (disconnected, or after a restart), with how long ago they were last active. Those stay listed, and resumable, for `SESSION_RETENTION_DAYS` (default 14) after their last activity, then their files are removed.
 
-### `stop_session`
+### `stop_session` and `disconnect_session`
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | Yes | Full session id from `start_session` / `list_sessions` (e.g. `my-project-a1b2c3`) |
-| `forget` | boolean | No | Also drop the session from `list_sessions`, so it can no longer be resumed from here |
+| `forget` | boolean | No | `stop_session` only. Deprecated and ignored: it now always forgets. Removed in the next version |
 
-Kills the `tmux` session. The conversation is kept, so the session can be resumed later, unless `forget` is set, which also removes its `~/.claude-rc-mcp/<id>.*` files.
+Both end the session the same way, and differ only in what is kept here:
+
+- **`stop_session`** closes it for good: the session is archived at claude.ai/code and its `~/.claude-rc-mcp/<id>.*` files are removed, so this server can no longer resume (or unarchive) it.
+- **`disconnect_session`** keeps it resumable: the session is archived at claude.ai/code too, but stays in `list_sessions`, and `resume_session`, `send_prompt` or `get_reply` bring it back - unarchived, same conversation, same URL. Conversational sessions only.
+
+How a session is ended: killing its `tmux` session hangs up the terminal, and on SIGHUP Claude Code shuts down in order, which is when its Remote Control bridge archives the session (`[remote-bridge] Torn down (archive=200)` in the debug log, within a second). The tool waits until the process is gone - SIGTERM, then SIGKILL, only if it hangs - and removes any status file left under the session's name, so no `tmux` session, process or status file is left behind. The archive is reported as the debug log has it. When there is no such record - the session was killed outright by a container restart, which archives nothing, or was started by an older version without a debug log - or the archive failed, the session is resumed (which reattaches to the same claude.ai/code session) and ended once more. If that does not confirm it either, the reply says so and gives the URL to archive it by hand.
+
+A legacy **Remote Control server**, recorded by an older version, is stopped with a SIGTERM of its own, so it can mark its environment offline. It never archives its sessions, though: Claude Code keeps a server's environment on shutdown, to be restarted, and `stop_session` reports that with the URL.
 
 ## Session system prompt
 
@@ -168,7 +181,6 @@ Lists directories under `PROJECTS_BASE_DIR` that look like projects (contain a `
 | `SSH_PORT` | No | SSH port (default: `22`) |
 | `SSH_PASSPHRASE` | No | Passphrase for an encrypted SSH key |
 | `CLAUDE_BIN` | No | `claude` binary on the server; set to an absolute path if not on the non-interactive SSH `PATH` (default: `claude`) |
-| `SPAWN_WORKTREE` | No | Boolean (default `false`). Default for the per-call `worktree` input |
 | `APPEND_SYSTEM_PROMPT` | No | Text appended to the system prompt of every conversational session, resumed ones included (see [Session system prompt](#session-system-prompt)) |
 | `SESSION_RETENTION_DAYS` | No | How long a session that is no longer running stays listed and resumable, counted from its last activity (default: `14`) |
 | `TOKEN_STORE_PATH` | No | Where issued OAuth tokens are persisted (default: `/data/oauth-tokens.json`) |
@@ -180,7 +192,7 @@ Lists directories under `PROJECTS_BASE_DIR` that look like projects (contain a `
 
 The remote development server must have:
 
-- **Claude Code installed and pre-authenticated** — run `claude` once and complete `/login` (Pro/Max/Team/Enterprise). This MCP does **not** handle Claude Code authentication; it only launches `remote-control`.
+- **Claude Code installed and pre-authenticated** — run `claude` once and complete `/login` (Pro/Max/Team/Enterprise). This MCP does **not** handle Claude Code authentication; it only launches `claude --rc`.
 - **`tmux`** installed.
 - **SSH key-based access** for the configured user. Use a dedicated key for a non-root user; `AllowUsers` and a restricted shell are recommended.
 
@@ -206,6 +218,13 @@ cd claude-code-rc-mcp
 npm install
 cp .env.example .env   # fill it in
 node --env-file=.env server.js
+```
+
+### Development
+
+```bash
+npm run verify   # node --check, ESLint and the node:test unit tests
+npm run e2e      # every tool against a local instance on the dev server - see CLAUDE.md
 ```
 
 ## Claude.ai Connector Setup

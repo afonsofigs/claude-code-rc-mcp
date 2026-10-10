@@ -1,5 +1,6 @@
 import { randomUUID, createHash, randomBytes } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
@@ -18,7 +19,6 @@ const SSH_USER = process.env.SSH_USER;
 const SSH_PRIVATE_KEY = process.env.SSH_PRIVATE_KEY;
 const SSH_PASSPHRASE = process.env.SSH_PASSPHRASE || undefined;
 const PROJECTS_BASE_DIR = process.env.PROJECTS_BASE_DIR;
-const SPAWN_WORKTREE = (process.env.SPAWN_WORKTREE || "false").toLowerCase() === "true";
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 const TOKEN_STORE_PATH = process.env.TOKEN_STORE_PATH || "/data/oauth-tokens.json";
 // Appended to the system prompt of every conversational session (`--append-system-prompt`),
@@ -41,18 +41,23 @@ const RC_SYSTEM_PROMPT =
   "tags: treat the text inside them as the user's own message, written by them for this session.";
 const SESSION_SYSTEM_PROMPT = [RC_SYSTEM_PROMPT, APPEND_SYSTEM_PROMPT].filter(Boolean).join("\n\n");
 const SESSION_RETENTION_DAYS = parseFloat(process.env.SESSION_RETENTION_DAYS || "14");
-const VERSION = "1.2.1";
+const VERSION = "1.3.0";
+
+// Run as the server, or imported by the tests for its pure functions - which
+// must not exit on missing configuration nor open a port.
+const IS_MAIN = Boolean(process.argv[1]) &&
+  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
 
 const required = { MCP_SECRET, SERVER_URL, SSH_HOST, SSH_USER, SSH_PRIVATE_KEY, PROJECTS_BASE_DIR };
 const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
-if (missing.length) {
+if (IS_MAIN && missing.length) {
   console.error(`Error: missing required environment variables: ${missing.join(", ")}`);
   process.exit(1);
 }
 
 // SSH_PRIVATE_KEY holds the key content. As a convenience, if it looks like a
 // filesystem path instead, read the file.
-const sshPrivateKey = SSH_PRIVATE_KEY.includes("PRIVATE KEY")
+const sshPrivateKey = !SSH_PRIVATE_KEY || SSH_PRIVATE_KEY.includes("PRIVATE KEY")
   ? SSH_PRIVATE_KEY
   : readFileSync(SSH_PRIVATE_KEY, "utf-8");
 
@@ -267,29 +272,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Strip ANSI escape sequences (the remote-control TUI redraws are full of them). */
 function stripAnsi(s) {
+  // Escape sequences are made of control characters: matching them is the point.
+  /* eslint-disable no-control-regex */
   return s
     .replace(/\][^]*(?:|\\)/g, "") // OSC (e.g. hyperlinks)
     .replace(/\[[0-9;?]*[ -/]*[@-~]/g, "") // CSI (cursor / colour codes)
     .replace(/\r/g, "\n"); // CR — TUI redraws overwrite lines in place
+  /* eslint-enable no-control-regex */
 }
 
 /**
  * The canonical claude.ai/code session link. Matching it exactly matters when
  * reading a rendered pane: the TUI also shows docs and promo links, and the URL
- * can end up flush against box-drawing characters, both of which the generic
- * "everything up to whitespace" pattern below would happily return.
+ * can end up flush against box-drawing characters, both of which a generic
+ * "everything up to whitespace" pattern would happily return.
  */
 function extractSessionUrl(text) {
   const m = text.match(/https?:\/\/(?:claude\.ai|claude\.com)\/code\/[A-Za-z0-9_-]+/);
   return m ? m[0] : null;
-}
-
-/** As above, falling back to the first URL of any shape — for logs only. */
-function extractUrl(log) {
-  const session = extractSessionUrl(log);
-  if (session) return session;
-  const any = log.match(/https?:\/\/[^\s'"\]]+/);
-  return any ? any[0] : null;
 }
 
 /** Last `n` meaningful lines of a log, with consecutive duplicates collapsed. */
@@ -352,6 +352,8 @@ const fail = (text) => ({ content: [{ type: "text", text }], isError: true });
  *   log      startup log (the pipe is detached once the session is up)
  *   prompt   initial prompt · sys: appended system prompt · send: last prompt sent
  *   pending  remote timestamp of the last send_prompt · tr: cached transcript path
+ *   debug    Claude Code's debug log (`--debug-file`), rewritten on every launch:
+ *            the only record of whether claude.ai/code archived the session
  *
  * Resolved to an absolute path once, so it can be interpolated anywhere,
  * including the command tmux runs, without quoting rules of its own.
@@ -384,6 +386,12 @@ const CLAUDE_PROJECTS_DIR = `${CLAUDE_DIR}/projects`;
 
 const b64 = (text) => Buffer.from(text, "utf-8").toString("base64");
 const fromB64 = (s) => (s && s !== "-" ? Buffer.from(s, "base64").toString("utf-8") : "");
+
+/**
+ * Every file of a session's record, as a glob: `<id>.*`, plus the debug logs a
+ * Remote Control server writes for the sessions it spawns, `<id>-cse_….debug`.
+ */
+const recordFiles = (S, id) => `${S}/${id}.* ${S}/${id}-cse_*`;
 
 /** Shell fragment that writes `text` to `path` without it ever meeting a shell parser. */
 const remoteWrite = (path, text) => `printf %s '${b64(text)}' | base64 -d > ${path}`;
@@ -512,20 +520,24 @@ async function interruptTurn(id, live) {
  * exited / errored), or the timeout elapses.
  *
  * The status file is the first source: it names the Remote Control session
- * outright. The fallbacks differ per mode. `fromPane` is for conversational
- * sessions: their TUI draws the URL in chunks separated by cursor-positioning
- * escapes, so stripping the escapes out of the raw log yields a mangled URL,
- * while tmux - being the terminal emulator - renders it correctly. It is off
- * for the Remote Control server, whose log is clean line output and whose
- * *pane* is the unreliable one: there the URL is long enough to be wrapped
- * across two rows. A `resumed` session gets no fallback at all - it redraws
- * its own history, and any session link in there would read as its URL. The
- * logfile is read regardless: it is what the caller reports as the startup
- * tail, and all that survives a session that dies before it is ever ready.
+ * outright. The fallback is the pane: the TUI draws the URL in chunks
+ * separated by cursor-positioning escapes, so stripping the escapes out of the
+ * raw log yields a mangled URL, while tmux - being the terminal emulator -
+ * renders it correctly. A `resumed` session gets no fallback at all - it
+ * redraws its own history, and any session link in there would read as its
+ * URL. The logfile is read regardless: it is what the caller reports as the
+ * startup tail, and all that survives a session that dies before it is ever
+ * ready.
+ *
+ * A session that stops on a startup dialog never gets a URL, so waiting it
+ * out would only end in "still initialising": it is reported as `dialog`
+ * straight away. The folder trust dialog is answered instead, once, when the
+ * caller passes `trustFolder` (see acceptTrustDialog).
  */
-async function pollSession(S, id, { timeoutMs = 35000, fromPane = false, resumed = false } = {}) {
+async function pollSession(S, id, { timeoutMs = 35000, resumed = false, trustFolder = false } = {}) {
   const deadline = Date.now() + timeoutMs;
   let log = "";
+  let trustAnswered = false;
   while (Date.now() < deadline) {
     await sleep(2000);
     const { out } = await sshSections((section) =>
@@ -538,9 +550,16 @@ async function pollSession(S, id, { timeoutMs = 35000, fromPane = false, resumed
     const live = parseLive(out.PROC, out.LIVE);
     log = stripAnsi(out.LOG || "").trim();
     const url = live?.url ||
-      (resumed ? null : fromPane ? extractSessionUrl(out.PANE || "") : extractUrl(log));
+      (resumed ? null : extractSessionUrl(out.PANE || ""));
     if (url) return { state: "ready", alive, url, log, live };
     if (!alive) return { state: "exited", alive: false, url: null, log };
+    const pane = stripAnsi(out.PANE || "");
+    const dialog = live ? null : startupDialog(pane);
+    if (dialog === "trust" && trustFolder && !trustAnswered) {
+      trustAnswered = true;
+      if (await acceptTrustDialog(id)) continue;
+    }
+    if (dialog) return { state: "dialog", dialog, alive: true, url: null, log, pane };
   }
   return { state: "starting", alive: true, url: null, log };
 }
@@ -562,18 +581,32 @@ async function pollSession(S, id, { timeoutMs = 35000, fromPane = false, resumed
  * records a conversation's system prompt on its first request and replays
  * that record until the conversation is compacted; from then on it renders
  * the prompt afresh from what the running process was given.
+ *
+ * So does `--debug-file`: the debug log is the one place where the Remote
+ * Control bridge says whether claude.ai/code archived the session when the
+ * process ended (see archiveOutcome). It is started afresh on each launch.
+ *
+ * A folder Claude Code does not trust would stop the session on the trust
+ * dialog before it ever reaches claude.ai/code, so that is checked first and
+ * nothing is launched (`state: "untrusted"`) - unless `trustFolder` says the
+ * user explicitly trusts it, and the dialog is to be answered.
  */
-async function launchConversation(S, id, meta, { task = "", resume = false } = {}) {
+async function launchConversation(S, id, meta, { task = "", resume = false, trustFolder = false } = {}) {
   const dir = metaDir(meta);
   const name = metaName(meta);
   const sid = metaSessionId(meta);
   if (!sid) return { error: "the session has no recorded conversation id" };
   const file = (ext) => `${S}/${id}.${ext}`;
+  if (!trustFolder && (await folderTrust(dir)) === "untrusted") return { state: "untrusted", dir };
 
+  // Launching brings the session back to claude.ai/code, archived or not.
+  const record = { ...meta };
+  delete record.archivedAt;
   const setup = [
-    remoteWrite(file("meta"), JSON.stringify(meta)),
+    remoteWrite(file("meta"), JSON.stringify(record)),
     remoteWrite(file("sys"), SESSION_SYSTEM_PROMPT),
     `: > ${file("log")}`,
+    `rm -f ${file("debug")}`,
   ];
   let args = `${resume ? " --resume" : " --session-id"} ${sid} --append-system-prompt "$(cat ${file("sys")})"`;
   if (task) {
@@ -581,7 +614,7 @@ async function launchConversation(S, id, meta, { task = "", resume = false } = {
     args += ` "$(cat ${file("prompt")})"`;
   }
   const bypassFlag = meta.bypass ? " --dangerously-skip-permissions" : "";
-  const inner = `${CLAUDE_BIN}${bypassFlag} --rc ${name}${args}`;
+  const inner = `${CLAUDE_BIN}${bypassFlag} --debug-file ${file("debug")} --rc ${name}${args}`;
 
   const r = await sshExec(
     `[ -d "${dir}" ] || { echo __NO_DIR__; exit 9; }; ` +
@@ -601,7 +634,7 @@ async function launchConversation(S, id, meta, { task = "", resume = false } = {
 
   // With a prompt the session is busy working while Remote Control is still
   // connecting, so the URL takes noticeably longer to show up.
-  const result = await pollSession(S, id, { timeoutMs: task ? 50000 : 35000, fromPane: true, resumed: resume });
+  const result = await pollSession(S, id, { timeoutMs: task ? 50000 : 35000, resumed: resume, trustFolder });
   if (result.state !== "exited") {
     // The startup log has served its purpose. Record the URL in its own file:
     // by the time `list_sessions` runs it has usually scrolled out of the pane.
@@ -638,6 +671,135 @@ function transcriptLookup(S, id) {
  * renders the frame, so the options come through as "│ ❯ 1. Yes".
  */
 const PERMISSION_RE = /(?:Do you want|Would you like)[\s\S]{0,400}?(?:^|\n)[\s│┃|]*(?:[❯>]\s*)?1\.\s/;
+
+/**
+ * Dialogs Claude Code opens before a session starts - the folder trust dialog
+ * above all - come before its status file and before Remote Control connects:
+ * the session is in no conversation yet, and nowhere to be seen at
+ * claude.ai/code. The pane is all there is to go by, so these are only looked
+ * for on a session without a status file, and only at the bottom of the pane,
+ * where the dialog sits. Matching whole lines keeps a prompt or a transcript
+ * that merely quotes them from counting: the trust dialog by its two options,
+ * any other dialog by the key hints printed under its selector.
+ */
+const TRUST_DIALOG_RE = /^[\s│┃|]*(?:[❯>]\s*)?Yes, I trust this folder\s*$[\s\S]*Enter to confirm/m;
+const TRUST_YES_SELECTED_RE = /^[\s│┃|]*[❯>]\s*Yes, I trust this folder\s*$/m;
+const STARTUP_DIALOG_RE = /^[\s│┃|]*Enter to confirm · Esc to cancel\s*$/m;
+
+/** "trust", "other" or null: the startup dialog a session without a status file is stuck on. */
+function startupDialog(pane) {
+  const bottom = paneTail(pane || "", 30);
+  if (TRUST_DIALOG_RE.test(bottom)) return "trust";
+  if (STARTUP_DIALOG_RE.test(bottom)) return "other";
+  return null;
+}
+
+/**
+ * Why a session stuck on a startup dialog cannot be helped from here. Neither
+ * key this server could press is safe on the trust dialog: it opens on "No,
+ * exit", so an Enter - the one `send_prompt` sends - would end the session,
+ * and Esc cancels it, which exits as well.
+ */
+function dialogMessage(id, dialog, { pane = "" } = {}) {
+  if (dialog === "trust") {
+    return (
+      `Session "${id}" is stuck on Claude Code's folder trust dialog ("Is this a project you created or one ` +
+      `you trust?"): it has not started, and it is not connected to claude.ai/code. Nothing sent from here ` +
+      `answers it safely - an Enter picks "No, exit" and Esc exits too - so send_prompt and interrupt_session ` +
+      `leave it alone. ${TRUST_IMPLICATIONS} Only if the user explicitly says they trust this folder: end this ` +
+      `session with stop_session and start a new one with \`trust_folder: true\`. Otherwise end it with stop_session.` +
+      (pane ? `\n\nPane:\n${paneTail(pane, 12)}` : "")
+    );
+  }
+  return (
+    `Session "${id}" is stuck on a dialog Claude Code opened before starting, so it is not connected to ` +
+    `claude.ai/code and cannot be answered from there or from here. It has to be answered in the terminal on ` +
+    `the server (tmux session rc-${id}), or the session ended with stop_session.` +
+    (pane ? `\n\nPane:\n${paneTail(pane, 12)}` : "")
+  );
+}
+
+/** Why a session was not launched in a folder Claude Code does not trust. */
+function untrustedMessage(id, dir, { resuming = false } = {}) {
+  return (
+    `${resuming ? `Session "${id}" was not resumed` : "No session was started"}: Claude Code does not trust ` +
+    `${dir}, so the session would stop on the folder trust dialog before ever reaching claude.ai/code. ` +
+    `${TRUST_IMPLICATIONS} Ask the user; only if they explicitly say they trust this folder, ` +
+    (resuming ? "trust it in a new session with start_session and `trust_folder: true`, then resume this one."
+      : "call start_session again with `trust_folder: true`.")
+  );
+}
+
+const TRUST_IMPLICATIONS =
+  "Trusting a folder lets the project's own configuration run without review - its hooks, its .mcp.json " +
+  "servers, its settings - from then on, in every Claude Code session on the server, and inside a git " +
+  "repository a trusted parent folder does not count.";
+
+/**
+ * The folder that makes Claude Code trust `real` without asking, or null - by
+ * its own rule: a folder counts when it or a folder above it was accepted in
+ * the trust dialog (`hasTrustDialogAccepted` in the global config), but inside
+ * a git repository the search stops at the repository root, so the trust given
+ * to a parent folder does not reach the repositories under it.
+ */
+function trustedBy(projects, real, gitRoot) {
+  const root = gitRoot || null;
+  let dir = real;
+  for (;;) {
+    if (root && !(dir === root || dir.startsWith(root.endsWith("/") ? root : `${root}/`))) return null;
+    if (projects?.[dir]?.hasTrustDialogAccepted) return dir;
+    if (dir === root) return null;
+    const up = dir.replace(/\/[^/]*$/, "") || "/";
+    if (up === dir) return null;
+    dir = up;
+  }
+}
+
+/**
+ * "trusted", "untrusted", or "unknown" when the lookup itself fell short -
+ * which is left for the launch to show, since the dialog is detected anyway.
+ * CLAUDE_CODE_SANDBOXED makes Claude Code trust everything; tmux hands its
+ * sessions the tmux server's environment, so that is checked as well.
+ */
+async function folderTrust(dir) {
+  const { out } = await sshSections((section) =>
+    section("REAL") + `cd "${dir}" 2>/dev/null && pwd -P; ` +
+    section("GIT") + `git -C "${dir}" rev-parse --show-toplevel 2>/dev/null; ` +
+    section("SANDBOX") + `printf '%s\\n' "$CLAUDE_CODE_SANDBOXED"; tmux show-environment -g CLAUDE_CODE_SANDBOXED 2>/dev/null; ` +
+    section("CONFIG") + `cat "\${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json" 2>/dev/null; true`,
+    { timeoutMs: 30000 }
+  );
+  const [shellValue, ...tmuxLines] = (out.SANDBOX || "").split("\n");
+  if (shellValue.trim() || tmuxLines.some((l) => /^CLAUDE_CODE_SANDBOXED=./.test(l))) return "trusted";
+  const real = (out.REAL || "").trim();
+  if (!real.startsWith("/")) return "unknown";
+  let config;
+  try { config = JSON.parse(out.CONFIG || ""); } catch { return "unknown"; }
+  return trustedBy(config?.projects, real, (out.GIT || "").trim()) ? "trusted" : "untrusted";
+}
+
+/**
+ * Answer the folder trust dialog with "Yes, I trust this folder" - only ever
+ * on an explicit `trust_folder`. The dialog opens on "No, exit" and ignores
+ * keys for a moment after it appears, so the selection is moved, read back off
+ * the pane, and confirmed only once it sits on the yes: an Enter anywhere else
+ * would end the session. Claude Code then records the trust itself, exactly as
+ * if it had been answered in the terminal.
+ */
+async function acceptTrustDialog(id) {
+  await sleep(1000);
+  for (let i = 0; i < 4; i++) {
+    const pane = stripAnsi((await sshExec(`tmux capture-pane -p -t rc-${id} 2>/dev/null; true`)).stdout);
+    if (startupDialog(pane) !== "trust") return false;
+    if (TRUST_YES_SELECTED_RE.test(paneTail(pane, 30))) {
+      await sshExec(`tmux send-keys -t rc-${id} Enter`);
+      return true;
+    }
+    await sshExec(`tmux send-keys -t rc-${id} Down`);
+    await sleep(700);
+  }
+  return false;
+}
 
 const MAX_REPLY_CHARS = 24000;
 
@@ -847,9 +1009,9 @@ async function openConversation(S, id) {
   if (state.meta.mode !== "session") {
     return {
       error:
-        `Session "${id}" is a Remote Control *server*, not a conversation - it spawns its sessions ` +
+        `Session "${id}" is a legacy Remote Control *server*, not a conversation - it spawns its sessions ` +
         `as separate processes, so there is nothing to send a prompt to or collect a reply from. Start ` +
-        `a conversational one with start_session (\`prompt: "…"\` or \`interactive: true\`) and use that.`,
+        `a new session with start_session and use that; close this one with stop_session.`,
     };
   }
 
@@ -859,6 +1021,10 @@ async function openConversation(S, id) {
     if (launched.error) return { error: `Session "${id}" was not running and could not be resumed: ${launched.error}.` };
     if (launched.state === "exited") {
       return { error: `Session "${id}" was not running, and exited again right after resuming.\n\nLog:\n${logTail(launched.log)}` };
+    }
+    if (launched.state === "untrusted") return { error: untrustedMessage(id, launched.dir, { resuming: true }) };
+    if (launched.state === "dialog") {
+      return { error: `Session "${id}" was not running, so it was resumed - but: ${dialogMessage(id, launched.dialog, { pane: launched.pane })}` };
     }
     state = await readState(S, id);
     resumed = true;
@@ -870,6 +1036,185 @@ async function openConversation(S, id) {
     await saveMeta(S, id, followed);
   }
   return { state, resumed };
+}
+
+// --- Ending sessions ---
+
+/**
+ * What the Remote Control bridge of a conversational session did at
+ * claude.ai/code when its process ended, by its own debug log: `Torn down
+ * (archive=<status>)` once it has asked for the archive - an HTTP status, or
+ * "timeout" / "no_token" when the request never got an answer - or `Teardown
+ * complete (skipArchive)` when it chose not to. Null when neither is there:
+ * the bridge never came up, or the process did not end cleanly.
+ */
+function archiveOutcome(debugLog) {
+  let outcome = null;
+  const re = /\[remote-bridge\] (?:Torn down \(archive=([^)\s]*)\)|Teardown complete \(skipArchive\))/g;
+  for (const m of (debugLog || "").matchAll(re)) {
+    outcome = m[1] !== undefined ? { archived: /^2\d\d$/.test(m[1]), status: m[1] } : { archived: false, status: "skipped" };
+  }
+  return outcome;
+}
+
+/**
+ * The same for a Remote Control server, which archives every session it
+ * served on its way out, unless it keeps its environment to be resumed. Null
+ * when its log does not say.
+ */
+function serverArchiveOutcome(debugLog) {
+  const log = debugLog || "";
+  if (/\[bridge:shutdown\] Skipping archive/.test(log)) return { archived: false, status: "skipped" };
+  if (!/\[bridge:shutdown\] Environment deregistered/.test(log)) return null;
+  const statuses = [...log.matchAll(/\[code-session\] Archive \S+ status=(\S+)/g)].map((m) => m[1]);
+  const failed = /Failed to archive session/.test(log) || statuses.some((st) => !/^2\d\d$/.test(st));
+  return { archived: !failed, status: statuses.join(",") || "no sessions" };
+}
+
+/** Whether the debug log shows the bridge ever reached claude.ai/code. */
+const bridgeConnected = (debugLog) =>
+  /\[remote-bridge\] (?:Created session|Reattaching to session)|\[bridge:repl\]|\[bridge:work\]/.test(debugLog || "");
+
+/**
+ * End a session's process the way Claude Code ends cleanly. For a
+ * conversational session, killing the tmux session hangs up its terminal, and
+ * on SIGHUP the CLI shuts down in order - which is when its Remote Control
+ * bridge archives the session at claude.ai/code (archive=200 within a second,
+ * by its debug log). A Remote Control server runs as `claude … | tee` under a
+ * shell, and a hangup would take `tee` down with it, so the server dies
+ * writing to a closed pipe halfway through its shutdown: it gets a SIGTERM of
+ * its own first, and the tmux session goes once it has exited.
+ *
+ * Then wait until every process is really gone - SIGTERM if one hangs past
+ * `graceSeconds`, SIGKILL as the last resort - and clear the status files left
+ * under this tmux session's name: by a SIGKILL here, or by a process an
+ * earlier container restart killed. With the tmux session gone, no running
+ * process can own one.
+ */
+async function endProcess(S, id, { graceSeconds = 15 } = {}) {
+  const ticks = graceSeconds * 4;
+  const { out } = await sshSections((section) =>
+    `P=$(tmux display -p -t rc-${id} '#{pane_pid}' 2>/dev/null); PIDS="$P"; FIRST=; ` +
+    `case "$(cat /proc/"$P"/comm 2>/dev/null)" in sh|bash|dash|ash) ` +
+    `for k in $(pgrep -P "$P"); do PIDS="$PIDS $k"; [ "$(cat /proc/"$k"/comm 2>/dev/null)" = tee ] || FIRST="$FIRST $k"; done;; esac; ` +
+    `gone() { for p in $1; do kill -0 "$p" 2>/dev/null && ! grep -q '^State:[[:space:]]*Z' /proc/"$p"/status 2>/dev/null && return 1; done; return 0; }; ` +
+    `wait_gone() { i=0; while ! gone "$1" && [ $i -lt $2 ]; do sleep 0.25; i=$((i+1)); done; gone "$1"; }; ` +
+    section("RESULT") +
+    `[ -n "$P" ] && echo running; ` +
+    `[ -n "$FIRST" ] && kill -TERM $FIRST 2>/dev/null && wait_gone "$FIRST" ${ticks}; ` +
+    `tmux kill-session -t rc-${id} 2>/dev/null; ` +
+    `if ! wait_gone "$PIDS" ${ticks}; then kill -TERM $PIDS 2>/dev/null; echo terminated; ` +
+    `wait_gone "$PIDS" 20 || { kill -KILL $PIDS 2>/dev/null; sleep 0.5; echo forced; }; fi; ` +
+    `gone "$PIDS" && echo gone; tmux has-session -t rc-${id} 2>/dev/null && echo tmux; ` +
+    `grep -l '"tmux": *"rc-${id}:' ${CLAUDE_DIR}/sessions/*.json 2>/dev/null | xargs -r rm -f; ` +
+    section("DEBUG") + `grep -aE '\\[(remote-bridge|bridge:repl|bridge:work|bridge:shutdown|code-session)\\]' ${S}/${id}.debug 2>/dev/null | tail -n 200; true`,
+    { timeoutMs: (2 * graceSeconds + 25) * 1000 }
+  );
+  const result = out.RESULT || "";
+  return {
+    wasRunning: /\brunning\b/.test(result),
+    forced: /\b(?:terminated|forced)\b/.test(result),
+    gone: /\bgone\b/.test(result) && !/\btmux\b/.test(result),
+    debug: out.DEBUG || "",
+  };
+}
+
+/** Wait (briefly) until a freshly launched session's bridge has reattached, so ending it archives it. */
+const waitBridgeConnected = (S, id) =>
+  sshExec(
+    `i=0; while ! grep -qa 'transport connected' ${S}/${id}.debug 2>/dev/null && [ $i -lt 40 ]; ` +
+    `do sleep 0.25; i=$((i+1)); done; true`,
+    { timeoutMs: 30000 }
+  );
+
+/**
+ * End a conversational session and have it archived at claude.ai/code.
+ *
+ * A running one is ended (endProcess) and its debug log read for the bridge's
+ * own account of the archive. When that account is missing or a failure - the
+ * session was already dead, killed outright by a container restart (no
+ * teardown, so never archived); it was started by a version of this server
+ * that gave no `--debug-file`; or the request failed - the conversation is
+ * resumed and ended once more: a resume reattaches to the same claude.ai/code
+ * session, unarchiving it on the way, and the clean exit that follows
+ * archives it again. One round of that; whatever its log says then stands.
+ * A session that never reached claude.ai/code (no URL, no bridge in its log)
+ * has nothing to archive.
+ *
+ * Returns `{ archive, url, notes, neverConnected?, ended }`, where `ended`
+ * says the process and tmux session are gone, and `archive` is the outcome
+ * (null when there is none to report).
+ */
+async function closeConversation(S, id, state) {
+  const notes = [];
+  let url = state.url;
+  let archive = null;
+  let connected = Boolean(url);
+  let ended = true;
+  if (state.alive) {
+    const done = await endProcess(S, id);
+    archive = archiveOutcome(done.debug);
+    connected ||= bridgeConnected(done.debug);
+    ended = done.gone;
+    if (done.forced) notes.push("its process did not exit on its own and had to be killed");
+  } else if (state.meta?.archivedAt) {
+    return { archive: { archived: true, status: "already archived when it was disconnected" }, url, notes, ended };
+  }
+  if (archive?.archived || !ended) return { archive, url, notes, ended };
+  if (!connected) return { archive, url, notes, ended, neverConnected: true };
+
+  notes.push(
+    state.alive
+      ? `the archive was not confirmed (${archive ? `archive=${archive.status}` : "no record of it"}), so the session was resumed and ended again`
+      : "it was not running, so it was resumed and ended again to archive it"
+  );
+  const launched = await resumeConversation(S, id, state.meta);
+  if (launched.error || launched.state !== "ready") {
+    const why = launched.error || (launched.state === "untrusted" ? "its folder is not trusted"
+      : launched.state === "dialog" ? "it stopped on a startup dialog"
+      : launched.state === "exited" ? `it exited right after resuming${launched.log ? `: ${logTail(launched.log, 4)}` : ""}`
+      : "it did not reconnect in time");
+    notes.push(`resuming it failed: ${why}`);
+    if (launched.state === "dialog" || launched.state === "starting") ended = (await endProcess(S, id)).gone;
+    return { archive, url, notes, ended };
+  }
+  url = launched.url || url;
+  await waitBridgeConnected(S, id);
+  const done = await endProcess(S, id);
+  if (done.forced) notes.push("after the resume, its process had to be killed");
+  return { archive: archiveOutcome(done.debug) || archive, url, notes, ended: done.gone };
+}
+
+/**
+ * End a legacy Remote Control server, launched by an older version of this
+ * server: it keeps its environment and archives none of its sessions, so this
+ * can only end it cleanly and say so.
+ */
+async function closeServer(S, id, state) {
+  if (!state.alive) return { archive: null, url: state.url, notes: [], ended: true, notRunning: true };
+  // Its sessions get up to 30s to finish before it shuts down.
+  const done = await endProcess(S, id, { graceSeconds: 40 });
+  const notes = done.forced ? ["its process did not exit on its own and had to be killed"] : [];
+  return { archive: serverArchiveOutcome(done.debug), url: state.url, notes, ended: done.gone, server: true };
+}
+
+/** One line on what claude.ai/code made of a session that was closed. */
+function archiveLine(closed) {
+  if (closed.notRunning) {
+    return "A Remote Control server that is no longer running cannot be resumed to archive its sessions: " +
+      "check https://claude.ai/code for any it left behind.";
+  }
+  if (closed.neverConnected) return "It never connected to claude.ai/code, so there was nothing to archive there.";
+  if (closed.archive?.archived) {
+    return /^\d/.test(closed.archive.status)
+      ? `Archived at claude.ai/code (the Remote Control bridge reported archive=${closed.archive.status}).`
+      : `Archived at claude.ai/code (${closed.archive.status}).`;
+  }
+  const why = closed.server && closed.archive?.status === "skipped"
+    ? "a Remote Control server keeps its environment on shutdown, to be restarted, and archives none of its sessions"
+    : closed.archive ? `the bridge reported archive=${closed.archive.status}` : "there is no record of the archive";
+  return `NOT confirmed archived at claude.ai/code (${why}). Archive it by hand` +
+    (closed.url ? `: ${closed.url}` : " in the session list at https://claude.ai/code") + ".";
 }
 
 /**
@@ -942,6 +1287,8 @@ async function waitForReply(S, id, meta, sinceIso, { timeoutMs, fromLine = null,
       return { state: "ended", partial: turn.partial, pane };
     }
     if (isIdle(live) && !sinceIso && turn.empty) return { state: "nothing", pane };
+    const dialog = live ? null : startupDialog(pane);
+    if (dialog) return { state: "dialog", dialog, pane };
     if (!live && PERMISSION_RE.test(pane)) return { state: "awaiting_permission", pane };
     if (Date.now() >= deadline) return { state: "running", pane };
     await sleep(3000);
@@ -996,6 +1343,8 @@ function formatOutcome(id, result, { url, waitedSeconds, notes = [] }) {
         `until someone responds. Open it and approve (or start sessions with ` +
         `\`bypass_permissions\` if they should run unattended).` + link + pane
       );
+    case "dialog":
+      return fail(`${lead}${dialogMessage(id, result.dialog, { pane: result.pane })}`);
     case "exited":
       return fail(`${lead}Session "${id}" is no longer running and produced no final answer.${pane}`);
     default:
@@ -1019,7 +1368,7 @@ const SERVER_INSTRUCTIONS = `
 This MCP launches and manages Claude Code Remote Control sessions on a remote
 development server over SSH. Use it when the user asks to "open / start / launch
 a remote (control) session", "spin up Claude on the dev server", "list my remote
-sessions", "stop session X", or anything equivalent — including ambiguous asks
+sessions", "close / disconnect session X", or anything equivalent — including ambiguous asks
 like "open Claude on <project>" once it is clear they mean the remote server,
 not their local machine.
 
@@ -1029,33 +1378,33 @@ Usage guidance:
   server's projects base directory.
 - Call \`list_sessions\` first if the user might already have a session for the
   same project - reuse it instead of creating a duplicate. It also lists
-  conversational sessions that are no longer running (typically because the dev
+  conversational sessions that are no longer running (disconnected, or the dev
   server restarted); those can be picked up again as they are.
 - \`bypass_permissions\` appends \`--dangerously-skip-permissions\`. Only set it
   when the user has explicitly asked to skip permission prompts (e.g. "no
   approvals", "yolo mode", "bypass permissions"). Never enable it on your own
   initiative.
+- Without a \`prompt\`, \`start_session\` opens an empty session: that is the
+  answer to "open me an RC session on X" - the user goes and uses it at
+  claude.ai/code, or drives it from here with \`send_prompt\`.
 - \`prompt\` makes the session start working immediately on that instruction —
   use it whenever the user says what the session should *do* ("open a session
   on X and run the tests", "start one on Y and run /security-review"), not just
   where to open it. Slash commands are valid prompts. The session stays open
   after the task, so the user can take over from claude.ai/code.
-- \`interactive: true\` opens an empty conversational session, for when the user
-  wants to drive it from here with \`send_prompt\` rather than give it a task
-  up front.
-- \`worktree: true\` is for when the user wants isolated git worktrees per
-  spawned sub-session; otherwise omit it and let the server default decide. It
-  does not apply to conversational sessions (\`prompt\` / \`interactive\`).
+- \`interactive\` and \`worktree\` are deprecated and ignored; leave them out.
 - After \`start_session\` returns a URL, surface it to the user — that is the
   link they open to drive the session from claude.ai/code.
 - \`send_prompt\` continues an existing conversation and returns the session's
   final answer; \`get_reply\` collects an answer that was not ready in time, or
   the answer to the \`prompt\` a session was started with. Prefer them over
   starting a second session on the same project — they keep the context and the
-  user can still watch at claude.ai/code. Both only work on conversational
-  sessions; \`list_sessions\` shows which sessions those are.
+  user can still watch at claude.ai/code. Every session \`start_session\` opens
+  works with them; only a legacy Remote Control server, from an older version
+  of this server, does not (\`list_sessions\` marks it).
 - A session that is not running is resumed automatically by \`send_prompt\` and
   \`get_reply\`, with its full conversation; \`resume_session\` does only that.
+  Resuming a disconnected session unarchives it at claude.ai/code.
 - \`send_prompt\` on a session that is still busy interrupts the running turn
   first (like pressing Esc), then sends - one turn at a time. To stop a turn
   without sending anything, use \`interrupt_session\`.
@@ -1063,9 +1412,22 @@ Usage guidance:
   and \`send_prompt\` / \`get_reply\` will report it instead of an answer. Say so
   rather than retrying: it is answered at claude.ai/code, or dismissed with
   \`interrupt_session\`.
-- \`stop_session\` ends the session's process (the conversation can still be
-  resumed); confirm with the user before calling it unless they named the id
-  explicitly. \`interrupt_session\` is the one for "stop what you are doing".
+- Ending a session. "Close / end / terminate / archive / get rid of" a session
+  means \`stop_session\`: it ends the process, archives the session at
+  claude.ai/code and removes it from \`list_sessions\` for good. "Disconnect /
+  pause / suspend / park it, keeping it resumable" means \`disconnect_session\`:
+  the process ends and the session is archived as well, but it stays in
+  \`list_sessions\`, and resuming it unarchives it under the same URL. Confirm
+  with the user before calling either unless they named the id explicitly.
+  Both say whether claude.ai/code confirmed the archive; when it did not, pass
+  on the URL they give for archiving it by hand. \`interrupt_session\` is the
+  one for "stop what you are doing".
+- A project folder Claude Code does not trust yet would stop the session on
+  its folder trust dialog, so \`start_session\` refuses it before launching
+  anything and says what trusting it implies. Relay that and ask; set
+  \`trust_folder\` only when the user explicitly says they trust that folder,
+  never on your own initiative. A session reported as stuck on a startup
+  dialog is not working on anything: say so instead of retrying.
 `.trim();
 
 function createMcpServer() {
@@ -1076,76 +1438,53 @@ function createMcpServer() {
 
   server.tool(
     "start_session",
-    "Launch a new Claude Code Remote Control session on the remote dev server (over SSH, inside a detached tmux session) and return its URL. " +
-      "Use when the user asks to start / open / spin up a remote Claude Code session on a given project. " +
-      "Pass `prompt` when the user wants the session to start working right away — 'open a session on X and run the tests', 'start a session and run /security-review'; the session stays open afterwards so they can take over from claude.ai/code. " +
+    "Open a new Claude Code Remote Control session on a project on the remote dev server (over SSH, inside a detached tmux session) and return its URL. " +
+      "Use when the user asks to start / open / spin up a remote (RC) Claude Code session on a project - 'open me an RC session on X' opens an empty session for them to use at claude.ai/code. " +
+      "Pass `prompt` when the user wants the session to start working right away - 'open a session on X and run the tests', 'start a session and run /security-review'; the session stays open afterwards so they can take over from claude.ai/code. " +
+      "Either way it is a conversation `send_prompt` / `get_reply` can drive from here too. " +
       "Prefer calling `list_projects` first to discover valid `path` values, and `list_sessions` to avoid duplicating a session for the same project. " +
-      "Set `bypass_permissions` only when the user explicitly asks to skip approval prompts.",
+      "Set `bypass_permissions` only when the user explicitly asks to skip approval prompts. " +
+      "A folder Claude Code does not trust yet is refused before anything is launched; set `trust_folder` only when the user explicitly says they trust that folder.",
     {
       name: z.string().describe("Short label for the session, shown in claude.ai/code (1-41 chars, [a-zA-Z0-9_-])"),
       path: z.string().describe("Project directory, relative to PROJECTS_BASE_DIR (e.g. 'my-project'). Use list_projects to discover valid values."),
-      prompt: z.string().optional().describe("Initial prompt or slash command to run as soon as the session opens (e.g. 'run the test suite' or '/security-review'). Switches the session to conversational mode (`claude --rc`), where `worktree` does not apply and `send_prompt` / `get_reply` work."),
-      interactive: z.boolean().optional().describe("If true, open an empty conversational session (`claude --rc`) with no initial prompt, ready to receive `send_prompt`. Implied by `prompt`. Like `prompt`, it disables `worktree`."),
-      worktree: z.boolean().optional().describe("If true, spawn on-demand sessions in isolated git worktrees (--spawn worktree). Defaults to the SPAWN_WORKTREE env var. Ignored when `prompt` or `interactive` is set."),
+      prompt: z.string().optional().describe("Initial prompt or slash command to run as soon as the session opens (e.g. 'run the test suite' or '/security-review'). Omit it to open an empty session."),
+      interactive: z.boolean().optional().describe("Deprecated and ignored: every session is now a conversation, empty unless `prompt` is given. It will be removed in the next version."),
+      worktree: z.boolean().optional().describe("Deprecated and ignored: it applied to the Remote Control server form (`--spawn worktree`), which this server no longer launches. It will be removed in the next version."),
       bypass_permissions: z.boolean().optional().describe("If true, launch with --dangerously-skip-permissions so the session does not prompt for tool approvals. Use with care — but note that a session without it will stall mid-turn on approval prompts, which blocks `send_prompt` from ever getting an answer."),
+      trust_folder: z.boolean().optional().describe("If true and Claude Code does not trust the project folder yet, answer its folder trust dialog with 'Yes, I trust this folder', which Claude Code then remembers for every later session there. Trusting a folder lets its hooks, .mcp.json servers and settings run without review. Only set it when the user explicitly says they trust this folder - never on your own initiative."),
     },
-    async ({ name, path, prompt, interactive, worktree, bypass_permissions }) => {
+    async ({ name, path, prompt, bypass_permissions, trust_folder }) => {
       try {
         validateName(name);
         const rel = validateRelPath(path);
         const task = (prompt || "").trim();
-        const conversational = Boolean(task) || interactive === true;
-        const suffix = randomBytes(3).toString("hex");
-        const id = `${name}-${suffix}`;
-        const dir = `${PROJECTS_BASE_DIR}/${rel}`;
-        const spawn = (worktree ?? SPAWN_WORKTREE) ? "worktree" : "same-dir";
+        const id = `${name}-${randomBytes(3).toString("hex")}`;
         const S = await stateDir();
 
-        // Two launch shapes. Conversational (`prompt` or `interactive`): a
-        // single session `claude --rc <name>`, the only form that accepts an
-        // initial prompt and the only one with a conversation of its own to
-        // send later prompts to. Its conversation id is chosen here rather than
-        // discovered afterwards, so the transcript is always the one file named
-        // after it, and a resume after a restart knows exactly what to reopen.
-        // Plain: the persistent Remote Control server (`claude remote-control`),
-        // which supports --spawn, but spawns its sessions as separate processes,
-        // so its pane is not a chat.
-        let result;
-        if (conversational) {
-          const meta = {
-            mode: "session",
-            dir,
-            name,
-            sessionId: randomUUID(),
-            bypass: Boolean(bypass_permissions),
-            createdAt: new Date().toISOString(),
-          };
-          result = await launchConversation(S, id, meta, { task });
-          if (result.error) return fail(`Could not start session "${id}": ${result.error}.`);
-        } else {
-          const logfile = `${S}/${id}.log`;
-          const bypassFlag = bypass_permissions ? " --dangerously-skip-permissions" : "";
-          const meta = { mode: "server", dir, name, bypass: Boolean(bypass_permissions), createdAt: new Date().toISOString() };
-          const inner = `${CLAUDE_BIN} remote-control --name ${name} --spawn ${spawn}${bypassFlag} 2>&1 | tee ${logfile}`;
-          const r = await sshExec(
-            `[ -d "${dir}" ] || { echo __NO_DIR__; exit 9; }; ` +
-            `command -v tmux >/dev/null 2>&1 || { echo __NO_TMUX__; exit 8; }; ` +
-            `tmux has-session -t rc-${id} 2>/dev/null && { echo __EXISTS__; exit 7; }; ` +
-            `${remoteWrite(`${S}/${id}.meta`, JSON.stringify(meta))}; ` +
-            `tmux new-session -d -s rc-${id} -c "${dir}" '${inner}' && echo __STARTED__`
-          );
-          if (r.stdout.includes("__NO_DIR__")) return fail(`Project directory not found: ${rel}`);
-          if (r.stdout.includes("__NO_TMUX__")) return fail("tmux is not installed on the remote server.");
-          if (!r.stdout.includes("__STARTED__")) {
-            return fail(`Failed to start tmux session (exit ${r.code}).\n${r.stdout}\n${r.stderr}`.trim());
-          }
-          result = await pollSession(S, id, { timeoutMs: 35000 });
-          if (result.url) await sshExec(`${remoteWrite(`${S}/${id}.url`, result.url)}; true`);
-        }
+        // One launch shape: a single session, `claude --rc <name> ["<prompt>"]`,
+        // with a conversation of its own to send later prompts to. Its
+        // conversation id is chosen here rather than discovered afterwards, so
+        // the transcript is always the one file named after it, and a resume
+        // after a restart knows exactly what to reopen. (The Remote Control
+        // server form, `claude remote-control`, is no longer launched: it never
+        // archives its sessions at claude.ai/code - see closeServer.)
+        const meta = {
+          mode: "session",
+          dir: `${PROJECTS_BASE_DIR}/${rel}`,
+          name,
+          sessionId: randomUUID(),
+          bypass: Boolean(bypass_permissions),
+          createdAt: new Date().toISOString(),
+        };
+        const result = await launchConversation(S, id, meta, { task, trustFolder: trust_folder === true });
+        if (result.error) return fail(`Could not start session "${id}": ${result.error}.`);
+        if (result.state === "untrusted") return fail(untrustedMessage(id, rel));
+        if (result.state === "dialog") return fail(dialogMessage(id, result.dialog, { pane: result.pane }));
         const tail = logTail(result.log);
 
         if (result.state === "exited") {
-          await sshExec(`rm -f ${S}/${id}.*`);
+          await sshExec(`rm -f ${recordFiles(S, id)}`);
           return fail(
             `Session "${id}" exited before becoming ready — likely a startup error ` +
             `(e.g. Claude Code not authenticated on the server).\n\nLog:\n${tail}`
@@ -1154,15 +1493,13 @@ function createMcpServer() {
 
         const header =
           `Session started: ${id}\n` +
-          `Project: ${rel}  ·  ` + (conversational ? `mode: conversational` : `spawn: ${spawn}`) +
+          `Project: ${rel}  ·  mode: conversational` +
           (bypass_permissions ? `  ·  bypass: on` : "") + `\n` +
           (task ? `Running: ${task.length > 120 ? `${task.slice(0, 117)}...` : task}\n` : "") +
           (result.url ? `Session URL: ${result.url}\n` : "") +
           `\nIt should now appear in the session list at https://claude.ai/code` +
-          (conversational
-            ? `\nYou can also drive it from here: \`send_prompt\` with id "${id}"` +
-              (task ? `, or \`get_reply\` to collect the answer to the initial prompt.` : `.`)
-            : "") +
+          `\nYou can also drive it from here: \`send_prompt\` with id "${id}"` +
+          (task ? `, or \`get_reply\` to collect the answer to the initial prompt.` : `.`) +
           (result.state === "starting" ? `\n(still initialising — give it a few more seconds)` : "");
         return ok(`${header}\n\nLog:\n${tail}`);
       } catch (err) {
@@ -1178,7 +1515,7 @@ function createMcpServer() {
       "The prompt is typed into the live conversation, so the session keeps all of its context and the exchange stays visible at claude.ai/code. " +
       "If the session is not running (e.g. the dev server restarted) it is resumed first; if it is still busy with a previous turn, that turn is interrupted first (like pressing Esc) - one turn at a time. " +
       "Long turns do not block: if the answer is not ready within `wait_seconds`, the call returns and `get_reply` collects it afterwards. " +
-      "Only works on conversational sessions — those started with a `prompt` or with `interactive: true`. Use `list_sessions` to find the id.",
+      "Works on every session `start_session` opens (only a legacy Remote Control server cannot take prompts). Use `list_sessions` to find the id.",
     {
       id: z.string().describe("Full session id from start_session / list_sessions (e.g. 'my-project-a1b2c3')"),
       prompt: z.string().describe("What to ask the session. Slash commands work too. Multi-line text is fine — it is pasted, not typed."),
@@ -1223,6 +1560,9 @@ function createMcpServer() {
             return fail(`Session "${id}" is still busy after pressing Esc, so the prompt was not sent.\n\nPane:\n${paneTail(state.pane)}`);
           }
           notes.push(`the ${state.live.status === "waiting" ? "open dialog was dismissed" : "turn that was still running was interrupted"} first`);
+        } else if (!state.live && startupDialog(state.pane)) {
+          // The Enter that submits a prompt would answer it - on the trust dialog, with "No, exit".
+          return fail(dialogMessage(id, startupDialog(state.pane), { pane: state.pane }));
         } else if (!state.live && PERMISSION_RE.test(state.pane)) {
           // No status file to go by: at least do not answer an approval prompt by accident.
           return fail(
@@ -1317,7 +1657,7 @@ function createMcpServer() {
     "interrupt_session",
     "Interrupt what a Claude Code session on the remote server is doing right now - the same as pressing Esc or the stop button. " +
       "Use when the user says 'stop', 'cancel that', 'esc', 'abort what it is doing', or to dismiss a question, approval prompt or dialog that is blocking a session. " +
-      "The session stays open and keeps its context, ready for the next `send_prompt`. To end the session itself, use `stop_session`.",
+      "The session stays open and keeps its context, ready for the next `send_prompt`. To end the session itself, use `stop_session` (for good) or `disconnect_session` (resumable).",
     {
       id: z.string().describe("Full session id from start_session / list_sessions (e.g. 'my-project-a1b2c3')"),
     },
@@ -1327,6 +1667,10 @@ function createMcpServer() {
         const S = await stateDir();
         const state = await readState(S, id);
         if (!state.alive) return fail(`Session "${id}" is not running, so there is nothing to interrupt.`);
+        if (!state.live && startupDialog(state.pane)) {
+          // Esc would answer it: on the trust dialog, it exits the session.
+          return fail(dialogMessage(id, startupDialog(state.pane), { pane: state.pane }));
+        }
         if (!state.live) {
           // No status file to go by: press Esc once, the one press that is always safe.
           await sshExec(`tmux send-keys -t rc-${id} Escape`);
@@ -1347,7 +1691,7 @@ function createMcpServer() {
 
   server.tool(
     "resume_session",
-    "Bring back a conversational Claude Code session that is no longer running - typically because the dev server restarted, or the session was stopped - with its full conversation, under the same id and URL. " +
+    "Bring back a conversational Claude Code session that is no longer running - typically because the dev server restarted, or the session was disconnected - with its full conversation, under the same id and URL (unarchived at claude.ai/code). " +
       "Use when the user asks to reopen / reconnect / revive / resume a session that `list_sessions` shows as not running. " +
       "`send_prompt` and `get_reply` already do this on their own, so this is for when the user only wants the session back.",
     {
@@ -1363,6 +1707,9 @@ function createMcpServer() {
         if (state.meta.mode !== "session") {
           return fail(`Session "${id}" is a Remote Control server, which has no conversation to resume. Start a new one with start_session.`);
         }
+        if (state.alive && !state.live && startupDialog(state.pane)) {
+          return fail(dialogMessage(id, startupDialog(state.pane), { pane: state.pane }));
+        }
         if (state.alive) return ok(`Session "${id}" is already running.${state.url ? `\nSession URL: ${state.url}` : ""}`);
 
         const meta = bypass_permissions === undefined ? state.meta : { ...state.meta, bypass: bypass_permissions };
@@ -1371,6 +1718,8 @@ function createMcpServer() {
         if (result.state === "exited") {
           return fail(`Session "${id}" exited right after resuming.\n\nLog:\n${logTail(result.log)}`);
         }
+        if (result.state === "untrusted") return fail(untrustedMessage(id, result.dir, { resuming: true }));
+        if (result.state === "dialog") return fail(dialogMessage(id, result.dialog, { pane: result.pane }));
         return ok(
           `Session resumed: ${id}\n` +
           `Project: ${metaDir(meta).slice(PROJECTS_BASE_DIR.length + 1)}  ·  mode: conversational` +
@@ -1388,7 +1737,7 @@ function createMcpServer() {
   server.tool(
     "list_sessions",
     "List the Claude Code sessions on the remote server: the running ones, with their URL, mode and whether they are working, idle or waiting for input, " +
-      "and the conversational ones that are no longer running (typically after a dev server restart), which `send_prompt` / `get_reply` / `resume_session` pick up again. " +
+      "and the conversational ones that are no longer running (disconnected, or after a dev server restart), which `send_prompt` / `get_reply` / `resume_session` pick up again. " +
       "`conversational` sessions are the ones `send_prompt` / `get_reply` can talk to. " +
       "Use when the user asks 'what sessions are running', 'do I have a session for X', before `start_session` to avoid duplicates, " +
       `or to look up the id of the session they want to send a prompt to. Sessions not running for more than ${SESSION_RETENTION_DAYS} days are forgotten.`,
@@ -1401,8 +1750,9 @@ function createMcpServer() {
           `m=$(base64 < "$f" | tr -d '\\n'); u=$(cat ${S}/"$id".url 2>/dev/null); ` +
           `if tmux has-session -t "rc-$id" 2>/dev/null; then ` +
           `P=$(tmux display -p -t "rc-$id" '#{pane_pid} #{session_created}' 2>/dev/null); ` +
-          `L=$(cat ${CLAUDE_DIR}/sessions/"\${P%% *}".json 2>/dev/null | base64 | tr -d '\\n'); ` +
-          `echo "ON $id \${P:-- -} \${L:--} $m \${u:--}"; ` +
+          `L=$(cat ${CLAUDE_DIR}/sessions/"\${P%% *}".json 2>/dev/null | base64 | tr -d '\\n'); C=; ` +
+          `[ -z "$L" ] && C=$(tmux capture-pane -p -S -40 -t "rc-$id" 2>/dev/null | base64 | tr -d '\\n'); ` +
+          `echo "ON $id \${P:-- -} \${L:--} $m \${u:--} \${C:--}"; ` +
           `else sid=$(grep -o '"sessionId": *"[0-9a-f-]*"' "$f" | cut -d'"' -f4); t=; ` +
           `[ -n "$sid" ] && t=$(find ${CLAUDE_PROJECTS_DIR} -maxdepth 2 -name "$sid.jsonl" -printf '%T@\\n' 2>/dev/null | head -n 1); ` +
           `echo "OFF $id \${sid:--} \${t:-0} $m \${u:--}"; fi; done; ` +
@@ -1418,12 +1768,13 @@ function createMcpServer() {
           const [kind, id, ...f] = line.trim().split(" ");
           if (!ID_RE.test(id || "")) continue;
           if (kind === "ON") {
-            const [pid, created, liveB64, metaB64, url] = f;
+            const [pid, created, liveB64, metaB64, url, paneB64] = f;
             const live = parseLive(`${pid} ${created}`, fromB64(liveB64));
             const meta = parseMeta(fromB64(metaB64));
             const moved = followConversation(meta, live);
             if (moved) followed.push(remoteWrite(`${S}/${id}.meta`, JSON.stringify(moved)));
-            sessions.push({ id, running: true, meta, live, url: live?.url || (url !== "-" ? url : null) });
+            const dialog = live ? null : startupDialog(stripAnsi(fromB64(paneB64)));
+            sessions.push({ id, running: true, meta, live, dialog, url: live?.url || (url !== "-" ? url : null) });
             known.add(id);
           } else if (kind === "OFF") {
             const [sid, mtime, metaB64, url] = f;
@@ -1444,11 +1795,13 @@ function createMcpServer() {
             sessions.push({ id, running: true, meta: null, live: null, url: null });
           }
         }
-        const upkeep = [...followed, ...stale.map((id) => `rm -f ${S}/${id}.*`)];
+        const upkeep = [...followed, ...stale.map((id) => `rm -f ${recordFiles(S, id)}`)];
         if (upkeep.length) await sshExec(`${upkeep.join("; ")}; true`);
         if (!sessions.length) return ok("No sessions.");
 
-        const status = (live) => {
+        const status = (live, dialog) => {
+          if (dialog === "trust") return "stuck on the folder trust dialog, not connected to claude.ai/code";
+          if (dialog) return "stuck on a startup dialog, not connected to claude.ai/code";
           if (!live) return "running";
           if (live.status === "busy") return "working";
           if (live.status === "waiting") return `waiting for input (${live.waitingFor || "dialog open"})`;
@@ -1458,10 +1811,11 @@ function createMcpServer() {
         sessions.sort((a, b) => (b.running - a.running) || ((b.lastActive || 0) - (a.lastActive || 0)));
         const body = sessions
           .map((s) => {
-            const kind = s.meta?.mode === "session" ? "conversational" : s.meta?.mode === "server" ? "remote-control server" : "no metadata";
+            const kind = s.meta?.mode === "session" ? "conversational" : s.meta?.mode === "server" ? "legacy remote-control server" : "no metadata";
             const state = s.running
-              ? (s.meta?.mode === "session" ? status(s.live) : "running")
-              : `not running${s.lastActive ? ` (last active ${ago(s.lastActive)} ago)` : ""}, resumable`;
+              ? (s.meta?.mode === "session" ? status(s.live, s.dialog) : "running")
+              : `${s.meta?.archivedAt ? "disconnected (archived at claude.ai/code)" : "not running"}` +
+                `${s.lastActive ? ` (last active ${ago(s.lastActive)} ago)` : ""}, resumable`;
             return `• ${s.id}  -  ${kind} · ${state}${s.url ? `\n    ${s.url}` : ""}`;
           })
           .join("\n");
@@ -1469,7 +1823,8 @@ function createMcpServer() {
         return ok(
           `Sessions (${running} running, ${sessions.length - running} not running):\n${body}` +
           (sessions.some((s) => s.meta?.mode === "session")
-            ? `\n\nConversational sessions accept \`send_prompt\` / \`get_reply\`; ones that are not running are resumed automatically.`
+            ? `\n\nConversational sessions accept \`send_prompt\` / \`get_reply\`; ones that are not running are resumed automatically ` +
+              `(which also unarchives them at claude.ai/code). \`stop_session\` closes one for good.`
             : "")
         );
       } catch (err) {
@@ -1478,39 +1833,104 @@ function createMcpServer() {
     }
   );
 
+  /**
+   * Shared by stop_session and disconnect_session, which differ only in what
+   * happens to the record here: both end the tmux session and the process,
+   * leave no status file behind, and see the session archived at claude.ai/code.
+   */
+  async function closeSession(id, { keep }) {
+    const S = await stateDir();
+    const state = await readState(S, id);
+    if (!state.meta && !state.alive) return { error: `No session with id "${id}".` };
+    if (keep && state.meta?.mode !== "session") {
+      return {
+        error: state.meta
+          ? `Session "${id}" is a Remote Control server, which cannot be resumed - there is nothing to keep. Use stop_session.`
+          : `Session "${id}" has no metadata (started by an older version of this server), so it cannot be resumed. Use stop_session.`,
+      };
+    }
+    let closed;
+    if (state.meta?.mode === "session") {
+      const followed = followConversation(state.meta, state.live);
+      if (followed) {
+        state.meta = followed;
+        await saveMeta(S, id, followed);
+      }
+      closed = await closeConversation(S, id, state);
+    } else {
+      closed = await closeServer(S, id, state);
+    }
+    if (keep) {
+      // A resume while closing rewrote the record (a later conversation, say): build on that one.
+      const current = parseMeta((await sshExec(`cat ${S}/${id}.meta 2>/dev/null; true`)).stdout) || state.meta;
+      const meta = { ...current };
+      if (closed.archive?.archived) meta.archivedAt = new Date().toISOString();
+      else delete meta.archivedAt;
+      await sshExec(`${remoteWrite(`${S}/${id}.meta`, JSON.stringify(meta))}; rm -f ${S}/${id}.send ${S}/${id}.prompt ${S}/${id}.debug`);
+    } else {
+      await sshExec(`rm -f ${recordFiles(S, id)}`);
+    }
+    return { closed, wasRunning: state.alive };
+  }
+
+  /** The reply of stop_session / disconnect_session: what was done, and anything that did not go to plan. */
+  function closeReply(id, { closed, wasRunning }, { keep }) {
+    const lines = [
+      wasRunning ? `Session "${id}" ended: its process and tmux session are gone.` : `Session "${id}" was not running.`,
+      archiveLine(closed),
+      keep
+        ? "It stays in list_sessions: resume_session, send_prompt or get_reply bring it back, unarchived, under the same URL."
+        : "It is removed from this server's list.",
+    ];
+    if (closed.notes.length) lines.push(`(${closed.notes.join("; ")})`);
+    if (!closed.ended) lines.push(`Its tmux session or process could not be confirmed gone: check rc-${id} on the server.`);
+    const text = lines.join("\n");
+    const failed = !closed.ended || (!closed.archive?.archived && !closed.neverConnected && !closed.notRunning);
+    return failed ? fail(text) : ok(text);
+  }
+
   server.tool(
     "stop_session",
-    "Stop a Claude Code session by its full id: ends its process (kills the tmux session). " +
-      "Any turn in progress is lost, but the conversation is kept - the session stays in `list_sessions` and can be resumed - unless `forget` is set. " +
-      "Confirm with the user before calling unless they explicitly named the id. " +
-      "To only stop what the session is doing, and keep it open, use `interrupt_session` instead. " +
+    "Close a Claude Code session for good, by its full id: ends its process and tmux session, archives it at claude.ai/code, and removes it from `list_sessions`, so it can no longer be resumed from here. " +
+      "Use when the user says close / end / finish / terminate / archive / get rid of a session. " +
+      "A session that is no longer running is briefly resumed and ended again so that it is archived too. " +
+      "Any turn in progress is lost. Confirm with the user before calling unless they explicitly named the id. " +
+      "To end the process but keep the session resumable, use `disconnect_session`; to only stop what the session is doing, use `interrupt_session`. " +
       "Use `list_sessions` to look up the id if the user only referenced the session by name.",
     {
       id: z.string().describe("Full session id as returned by start_session / list_sessions (e.g. 'my-project-a1b2c3')"),
-      forget: z.boolean().optional().describe("If true, also drop the session from list_sessions, so it can no longer be resumed from here. The conversation itself stays in claude.ai/code."),
+      forget: z.boolean().optional().describe("Deprecated and ignored: stop_session now always removes the session from list_sessions. It will be removed in the next version."),
     },
-    async ({ id, forget }) => {
+    async ({ id }) => {
       try {
         validateId(id);
-        const S = await stateDir();
-        if (!forget) {
-          const state = await readState(S, id);
-          const followed = followConversation(state.meta, state.live);
-          if (followed) await saveMeta(S, id, followed);
-        }
-        const r = await sshExec(
-          `tmux kill-session -t rc-${id} 2>/dev/null && echo __KILLED__; ` +
-          `[ -f ${S}/${id}.meta ] && echo __KNOWN__; ` +
-          (forget ? `rm -f ${S}/${id}.*` : `rm -f ${S}/${id}.send ${S}/${id}.prompt`)
-        );
-        const killed = r.stdout.includes("__KILLED__");
-        const known = r.stdout.includes("__KNOWN__");
-        if (!killed && !known) return fail(`No session with id "${id}".`);
-        if (forget) return ok(`Session "${id}" ${killed ? "stopped and " : ""}forgotten.`);
-        if (!killed) return ok(`Session "${id}" was not running.`);
-        return ok(`Session "${id}" stopped.` + (known ? ` Its conversation is kept: send_prompt, get_reply or resume_session bring it back.` : ""));
+        const r = await closeSession(id, { keep: false });
+        if (r.error) return fail(r.error);
+        return closeReply(id, r, { keep: false });
       } catch (err) {
         return fail(`stop_session error: ${err.message}`);
+      }
+    }
+  );
+
+  server.tool(
+    "disconnect_session",
+    "Disconnect a conversational Claude Code session, by its full id, while keeping it resumable: ends its process and tmux session, and the session is archived at claude.ai/code, " +
+      "but it stays in `list_sessions` and `resume_session` / `send_prompt` / `get_reply` bring it back - unarchived, same conversation, same URL. " +
+      "Use when the user wants to pause / suspend / disconnect / park a session to pick it up later. " +
+      "Any turn in progress is lost. Confirm with the user before calling unless they explicitly named the id. " +
+      "To close a session for good, use `stop_session`.",
+    {
+      id: z.string().describe("Full session id as returned by start_session / list_sessions (e.g. 'my-project-a1b2c3')"),
+    },
+    async ({ id }) => {
+      try {
+        validateId(id);
+        const r = await closeSession(id, { keep: true });
+        if (r.error) return fail(r.error);
+        return closeReply(id, r, { keep: true });
+      } catch (err) {
+        return fail(`disconnect_session error: ${err.message}`);
       }
     }
   );
@@ -1633,7 +2053,7 @@ app.delete("/mcp", authMiddleware, async (req, res) => {
   }
 });
 
-app.listen(PORT, "0.0.0.0", () => {
+if (IS_MAIN) app.listen(PORT, "0.0.0.0", () => {
   console.log(`claude-code-rc-mcp listening on :${PORT}`);
   console.log(`OAuth issuer:        ${SERVER_URL}`);
   console.log(`OAuth client_id:     ${FIXED_CLIENT_ID}`);
@@ -1642,3 +2062,10 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`SSH target:          ${SSH_USER}@${SSH_HOST}:${SSH_PORT}`);
   console.log(`Projects base dir:   ${PROJECTS_BASE_DIR}`);
 });
+
+// For the tests: the parts that need neither SSH nor a running server.
+export {
+  stripAnsi, extractSessionUrl, parseLive, parseJsonl, turnAfter, outcomeOf,
+  startupDialog, TRUST_YES_SELECTED_RE, dialogMessage, untrustedMessage, trustedBy,
+  archiveOutcome, serverArchiveOutcome, bridgeConnected, archiveLine, formatOutcome,
+};

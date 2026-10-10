@@ -2,15 +2,16 @@
 
 ## What is this?
 
-A self-hosted MCP server that launches `claude remote-control` sessions on a remote
-development server over SSH, and holds conversations with them. Eight tools:
+A self-hosted MCP server that launches Claude Code Remote Control sessions on a remote
+development server over SSH, and holds conversations with them. Nine tools:
 `start_session`, `send_prompt`, `get_reply`, `interrupt_session`, `resume_session`,
-`list_sessions`, `stop_session`, `list_projects`. Protected by OAuth 2.1 with
+`list_sessions`, `disconnect_session`, `stop_session`, `list_projects`. Protected by OAuth 2.1 with
 credentials derived from `MCP_SECRET`.
 
 ## Stack
 
-- Node.js (ESM), single file: `server.js`
+- Node.js (ESM), single file: `server.js` (importable: it only exits on missing
+  config and listens when run as the entry point, so the tests can load it)
 - `@modelcontextprotocol/sdk` — MCP protocol, OAuth handlers, Streamable HTTP transport
 - `ssh2` — SSH client
 - `express` — HTTP server
@@ -20,7 +21,10 @@ credentials derived from `MCP_SECRET`.
 
 ```
 server.js          — All server code (OAuth provider, SSH helper, MCP tools, Express app)
-package.json       — Dependencies
+test/              — Unit tests (node:test) of the pure parts, with pane fixtures
+scripts/e2e.mjs    — End-to-end check of every tool against a local instance
+eslint.config.js   — Lint config (recommended rules)
+package.json       — Dependencies; `npm run verify` = check + lint + test
 Dockerfile         — Container build
 k8s/deployment.yaml — Example Kubernetes manifest
 .github/workflows/ — CI/CD to ghcr.io
@@ -38,26 +42,26 @@ node --env-file=.env server.js
 - **SSH, not a sidecar / `kubectl exec`** — the MCP is a standalone deployment that
   reaches the dev server over SSH, which keeps it portable to any host (VM,
   bare-metal, pod with sshd), not just Kubernetes.
-- **tmux workaround** — `claude remote-control` requires a TTY and has no headless
-  mode. Each session runs as `claude remote-control … 2>&1 | tee <state>/<id>.log`
-  inside a detached `tmux` session named `rc-<id>`.
+- **tmux workaround** — `claude --rc` requires a TTY and has no headless mode.
+  Each session runs inside a detached `tmux` session named `rc-<id>`.
 - **State on the home volume, not /tmp** - per-session files live in
-  `~/.claude-rc-mcp/<id>.{meta,url,log,prompt,sys,send,pending,tr}` on the dev
+  `~/.claude-rc-mcp/<id>.{meta,url,log,prompt,sys,send,pending,tr,debug}` on the dev
   server (`<state>` below). A container restart wipes /tmp, and the transcripts
   under `~/.claude` survive it, so the pointer to them has to survive too:
   `meta` (mode, dir, name, conversation id, bypass) is what a resume relaunches
   from. The directory is resolved to an absolute path once per process
   (`stateDir()`) so it interpolates like a literal.
-- **Two launch shapes** — `claude remote-control` takes no initial prompt (its
-  usage is `[options]` only). So when `start_session` is given a `prompt`, it
-  launches `claude --rc <name> "<prompt>"` instead (`--rc` is the short form of
-  `--remote-control [name]`): a single interactive session with Remote Control
-  enabled, which does accept a positional prompt. `interactive: true` is the
-  same shape with the prompt omitted. Both are "conversational" mode — the only
-  mode `send_prompt` works on, because the server form spawns its sessions as
-  separate child processes and its pane is not a chat. The trade-off is
-  `--spawn`, which exists only on the server form, so `worktree` is ignored
-  there. The session stays open after the task completes.
+- **One launch shape** — every session is `claude --rc <name> ["<prompt>"]`
+  (`--rc` is the short form of `--remote-control [name]`): a single interactive
+  session with Remote Control enabled, empty without a prompt - "open me an RC
+  session on X" - and working on it with one. It stays open after the task.
+  The Remote Control server form, `claude remote-control` (no initial prompt,
+  `--spawn` for worktrees, its sessions spawned as separate processes so its
+  pane is not a chat), was launched without a prompt until 1.3.0 and is no
+  longer: it never archives its sessions (see below), so it could not be
+  closed cleanly. `interactive` and `worktree` stay accepted and ignored for one
+  version, like `forget`; `SPAWN_WORKTREE` is no longer read. Records of `mode:
+  "server"` left by older versions are still listed and closed (`closeServer`).
 - **Prompt never touches a shell parser** — it is base64-encoded in Node,
   decoded into `<state>/<id>.prompt` on the server, and read back inside the
   tmux command as `"$(cat …)"`. That is why prompts can hold quotes, `$(…)`,
@@ -68,22 +72,56 @@ node --env-file=.env server.js
   with "Input must be provided…". So the pane runs `claude` directly and the log
   is captured with `tmux pipe-pane`. The pipe is detached once the session is up:
   it mirrors every TUI redraw and would otherwise grow without bound.
-- **URL source differs per mode** — the interactive TUI draws the URL in chunks
-  split by cursor-positioning escapes, so `stripAnsi` on the raw log yields a
-  mangled URL (a dropped character); `tmux capture-pane` renders it correctly.
-  The Remote Control server is the mirror image: its `tee` log is clean line
-  output, while its pane wraps the (longer) environment URL across two rows.
-  Hence `pollSession({fromPane})` - pane first for prompt mode only. Both are
-  fallbacks now: the status file (below) names the Remote Control session
-  outright, and it is the only source trusted after a resume, whose pane and log
-  redraw a history that may contain other session links. The resolved URL is
-  written to `<state>/<id>.url` so `list_sessions` reports it without re-parsing.
+- **URL from the status file, else the pane** — the interactive TUI draws the
+  URL in chunks split by cursor-positioning escapes, so `stripAnsi` on the raw
+  log yields a mangled URL (a dropped character); `tmux capture-pane` renders it
+  correctly. That is only the fallback: the status file (below) names the Remote
+  Control session outright, and it is the only source trusted after a resume,
+  whose pane redraws a history that may contain other session links. The
+  resolved URL is written to `<state>/<id>.url` so `list_sessions` reports it
+  without re-parsing.
 - **Sessions auto-terminate, records do not** - because the pane runs `claude`
   directly, the `tmux` session ends when `claude` exits: no zombie tmux sessions.
   The record in `<state>` stays, and `list_sessions` shows the session as not
   running and resumable until `SESSION_RETENTION_DAYS` after its transcript was
   last written, then deletes its files. A server-mode record, or one whose
   transcript is gone, is deleted as soon as its session is not running.
+- **Closing archives, and says so** - `stop_session` (record removed) and
+  `disconnect_session` (record kept, `archivedAt` in `meta`) end a session the
+  same way: `tmux kill-session` hangs up the terminal, and on SIGHUP the CLI
+  shuts down in order, which is when its Remote Control bridge archives the
+  session at claude.ai/code (a resume unarchives it, same URL). A SIGKILL - a
+  container restart - skips that, so nothing is archived. The only record of the
+  archive is the CLI's debug log, hence `--debug-file <state>/<id>.debug` on
+  every launch, read for `[remote-bridge] Torn down (archive=<status>)`. No
+  record, or a failure, gets one round of resume-and-end-again; then the reply
+  states the outcome, with the URL to archive by hand if it is still unconfirmed.
+  Both wait until the process is gone (SIGTERM, then SIGKILL, only if it hangs)
+  and remove status files left under the tmux session's name. There is no CLI
+  command or supported API to archive a session from outside.
+- **A Remote Control server is not archived** - `claude remote-control` keeps
+  its environment on shutdown ("Skipping archive+deregister to allow resume"),
+  and its spawned sessions do not archive themselves either - which is why it is
+  no longer launched. Closing a legacy one, `stop_session` reports it as not
+  archived, with the URL. It gets a SIGTERM of its own
+  before the tmux session goes: a hangup kills the `tee` it writes to, and the
+  server then dies halfway through its shutdown, without marking its
+  environment offline.
+- **Folder trust is checked first, and only answered on request** - until its
+  folder trust dialog is answered, a session has no status file, no transcript
+  and no Remote Control, and `--dangerously-skip-permissions` does not skip it.
+  `launchConversation` applies Claude Code's own rule first (`trustedBy`: the
+  folder or one above it accepted in `~/.claude.json`, but inside a git
+  repository only up to its root) and launches nothing for an untrusted folder.
+  `trust_folder` launches anyway and answers the dialog in the TUI - Down, read
+  the pane back until "Yes, I trust this folder" is selected, then Enter - so the
+  CLI records the trust itself; writing `~/.claude.json` from here would race
+  the running CLIs that rewrite it.
+- **Startup dialogs are reported, never pressed** - a session without a status
+  file whose pane bottom shows the trust dialog (by its options, as whole
+  lines) or a selector's "Enter to confirm · Esc to cancel" hints is `dialog`,
+  in every tool. That dialog opens on "No, exit": the Enter `send_prompt`
+  sends would end the session, and Esc exits as well, so neither is pressed.
 - **Logfile, not `capture-pane`, for diagnostics** — `start_session` polls the
   logfile, which survives even if the session dies on a startup error;
   `capture-pane` would not. (`capture-pane` is used only to read the URL of a
@@ -145,8 +183,8 @@ node --env-file=.env server.js
   `busy` or `waiting` (`interruptTurn`), once, and again only if it plainly did
   not take after 4s, because a second Esc on an idle prompt opens the rewind
   menu.
-- **Not running is recoverable** - `send_prompt` / `get_reply` resume a stopped
-  conversational session first (`openConversation`): `claude --rc <name>
+- **Not running is recoverable** - `send_prompt` / `get_reply` resume a disconnected
+  or crashed conversational session first (`openConversation`): `claude --rc <name>
   --resume <uuid>` in a tmux session of the same name, so the id and even the
   claude.ai/code URL stay the same. A resumed session that opens on a dialog is
   reported, not Esc'd.
@@ -192,15 +230,17 @@ node --env-file=.env server.js
 - **Shell-injection hardening** — `name`, `path` and `id` are strictly validated
   before being interpolated into SSH commands.
 - **Opt-in bypass permissions** — `start_session` accepts a `bypass_permissions`
-  flag that appends `--dangerously-skip-permissions` to the `claude remote-control`
+  flag that appends `--dangerously-skip-permissions` to the `claude --rc`
   invocation. It is off by default and must be set explicitly per call; the
   response header surfaces `bypass: on` so the choice is visible.
 - **Server-level instructions** — the `McpServer` is constructed with an
   `instructions` string (`SERVER_INSTRUCTIONS`) that the SDK delivers to the
   client at `initialize` time. It tells the model when to reach for these tools
   (trigger phrasings, ordering rules: `list_projects` → `start_session`,
-  `list_sessions` before reusing/duplicating, etc.) and which behaviours need
-  explicit user consent (`bypass_permissions`, `stop_session`). Tool
+  `list_sessions` before reusing/duplicating, etc.), which words map to
+  `stop_session` (close / archive) and `disconnect_session` (keep resumable),
+  and which behaviours need explicit user consent (`bypass_permissions`,
+  `trust_folder`, `stop_session`, `disconnect_session`). Tool
   descriptions echo the same cues so they fire even if the client truncates the
   server instructions.
 
@@ -218,6 +258,7 @@ In `OAuthProvider.exchangeAuthorizationCode()`, change `expiresIn` (default 8640
 
 ### Test locally
 ```bash
+npm run verify   # node --check + eslint + node:test; all must pass
 curl http://localhost:3000/health
 curl http://localhost:3000/.well-known/oauth-authorization-server
 ```
@@ -227,7 +268,15 @@ pre-seeded `TOKEN_STORE_PATH` (`{"tokens":{"t":{"clientId":"x","scopes":[],"expi
 and call it with the SDK's `Client` + `StreamableHTTPClientTransport`, passing
 `Authorization: Bearer t`. Point `CLAUDE_BIN` at a wrapper that does
 `exec claude --model haiku "$@"` to keep turns cheap, and use a throwaway
-project, trusted once by hand (the trust dialog blocks a fresh directory). A
+project, trusted once by hand (the trust dialog blocks a fresh directory).
+`scripts/e2e.mjs` does all of that against such an instance (`npm run e2e`, on
+the dev server, with `CLAUDE_BIN` set for the blocked-session scenario): every
+tool, closing running, busy and dead sessions with no tmux, process or status
+file left, the trust scenarios, and closing a legacy Remote Control server (a
+stand-in that runs and logs like one: a real one would leave an unarchived
+session at claude.ai/code on every run). Its sessions are archived at the end;
+the `trustFolder` scenario leaves a trust entry for a deleted folder in
+`~/.claude.json`. A
 test project gets auto-memory like any other, so "remember X" style checks leak
 across its sessions. Never interrupt or stop the session you are running in:
 it is an `rc-*` tmux session too.

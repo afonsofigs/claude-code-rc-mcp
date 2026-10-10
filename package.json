@@ -1,11 +1,16 @@
 {
   "name": "claude-code-rc-mcp",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Self-hosted MCP server that launches Claude Code Remote Control sessions on a remote dev server over SSH",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js",
+    "lint": "eslint .",
+    "test": "node --test test/",
+    "verify": "npm run check && npm run lint && npm test",
+    "e2e": "node scripts/e2e.mjs"
   },
   "keywords": [
     "mcp",
@@ -24,5 +29,10 @@
   },
   "overrides": {
     "qs": "6.16.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "globals": "^17.13.0"
   }
 }
