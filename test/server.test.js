@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import {
   parseLive, parseJsonl, turnAfter, startupDialog, TRUST_YES_SELECTED_RE, trustedBy,
   archiveOutcome, serverArchiveOutcome, bridgeConnected, archiveLine, formatOutcome,
+  expiryAction, flagReason,
 } from "../server.js";
 
 const fixture = (name) => readFileSync(new URL(`fixtures/${name}`, import.meta.url), "utf-8");
@@ -196,4 +197,44 @@ test("an interrupted turn and a slash command's output both end a turn", () => {
 
 test("parseJsonl skips partial lines", () => {
   assert.equal(parseJsonl('{"a":1}\n{"b":\nnot json\n{"c":3}\n').length, 2);
+});
+
+// --- Expiry ---
+
+const DAY = 86400000;
+const NOW = Date.parse("2026-10-20T12:00:00Z");
+const conv = (extra = {}) => ({ mode: "session", sessionId: "2f8bd080-2260-4185-95b2-c821808e7915", ...extra });
+const expiry = (over) => expiryAction({ meta: conv(), searched: true, lastActive: NOW - 20 * DAY, url: "https://claude.ai/code/session_01A", now: NOW, retentionMs: 14 * DAY, ...over });
+
+test("an expired session is closed (archived) before it is forgotten", () => {
+  assert.equal(expiry({}), "close");
+  assert.equal(expiry({ lastActive: NOW - 3 * DAY }), "keep");
+});
+
+test("an expired session that was archived when it was disconnected is simply forgotten", () => {
+  assert.equal(expiry({ meta: conv({ archivedAt: "2026-10-01T00:00:00Z" }) }), "forget");
+});
+
+test("a record that cannot be archived from here stays listed, flagged", () => {
+  assert.equal(expiry({ meta: conv({ archiveFailed: { reason: "archive=500" } }) }), "flag");
+  assert.equal(expiry({ lastActive: 0 }), "flag");
+  assert.equal(expiry({ meta: { mode: "server" } }), "flag");
+  assert.equal(expiry({ meta: null }), "flag");
+});
+
+test("with no URL there is nothing at claude.ai/code to archive", () => {
+  assert.equal(expiry({ lastActive: 0, url: null }), "forget");
+  assert.equal(expiry({ meta: { mode: "server" }, url: null }), "forget");
+});
+
+test("a record the shell could not read is kept, and one being closed stays being closed", () => {
+  assert.equal(expiry({ searched: false }), "keep");
+  assert.equal(expiry({ meta: conv({ expiringSince: "2026-10-20T11:59:00Z" }), lastActive: NOW - 60000 }), "close");
+});
+
+test("a flagged record says why it is not archived", () => {
+  assert.match(flagReason({ mode: "server" }), /archives none of its sessions/);
+  assert.match(flagReason(conv({ archiveFailed: { reason: "the bridge reported archive=500" } })), /archive=500/);
+  assert.match(flagReason(conv()), /transcript is gone/);
+  assert.match(flagReason(null), /no metadata/);
 });

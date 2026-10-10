@@ -84,8 +84,21 @@ node --env-file=.env server.js
   directly, the `tmux` session ends when `claude` exits: no zombie tmux sessions.
   The record in `<state>` stays, and `list_sessions` shows the session as not
   running and resumable until `SESSION_RETENTION_DAYS` after its transcript was
-  last written, then deletes its files. A server-mode record, or one whose
-  transcript is gone, is deleted as soon as its session is not running.
+  last written.
+- **Expiry closes, it does not just forget** - past `SESSION_RETENTION_DAYS`,
+  `list_sessions` closes a session exactly like `stop_session` (resume, clean
+  exit, archive confirmed in the debug log) before its record goes, so nothing
+  leaves the list unarchived (`expiryAction` decides, `expireSession` does it).
+  It runs in the background of the listing, a resume being far slower than a
+  listing; meanwhile the record carries `expiringSince`, which makes a later
+  listing finish the job if this server restarted halfway through (the resume
+  rewrites the transcript, so its age no longer says it expired). The next
+  listing reports what was closed (`expiredReports`, in memory). A record that
+  was archived when it was disconnected is simply forgotten. One that cannot be
+  archived from here - archive failed (`archiveFailed` in `meta`, not retried
+  on its own), transcript gone, a legacy server, no metadata - stays listed as
+  NOT archived with its URL until `stop_session` removes it; only a record with
+  no URL (never connected) is dropped at once.
 - **Closing archives, and says so** - `stop_session` (record removed) and
   `disconnect_session` (record kept, `archivedAt` in `meta`) end a session the
   same way: `tmux kill-session` hangs up the terminal, and on SIGHUP the CLI
@@ -202,8 +215,8 @@ node --env-file=.env server.js
   request to a fresh transport got a 400 "Server not initialized", and a
   claude.ai chat open across the restart failed its tool calls; the spec's
   404 tells a client to initialize again.
-- **Records are only pruned on a lookup that worked** - `list_sessions` deletes
-  a stopped session's files when its transcript is gone, so the shell echoes
+- **Records are only judged on a lookup that worked** - `list_sessions` acts on
+  a stopped session whose transcript is gone, so the shell echoes
   the conversation id it searched for and Node checks it against `meta`: a
   record the shell failed to parse is kept (JSON with spaces once wiped all of
   them).
@@ -269,10 +282,14 @@ and call it with the SDK's `Client` + `StreamableHTTPClientTransport`, passing
 `Authorization: Bearer t`. Point `CLAUDE_BIN` at a wrapper that does
 `exec claude --model haiku "$@"` to keep turns cheap, and use a throwaway
 project, trusted once by hand (the trust dialog blocks a fresh directory).
+Give the instance its own `REMOTE_STATE_DIR` (the e2e expects
+`~/.claude-rc-mcp-e2e`): sharing the real one, its expiry would close the real
+sessions, and production's would touch the test ones.
 `scripts/e2e.mjs` does all of that against such an instance (`npm run e2e`, on
 the dev server, with `CLAUDE_BIN` set for the blocked-session scenario): every
 tool, closing running, busy and dead sessions with no tmux, process or status
-file left, the trust scenarios, and closing a legacy Remote Control server (a
+file left, the trust scenarios, expiry (archived, forgotten, flagged), and
+closing a legacy Remote Control server (a
 stand-in that runs and logs like one: a real one would leave an unarchived
 session at claude.ai/code on every run). Its sessions are archived at the end;
 the `trustFolder` scenario leaves a trust entry for a deleted folder in

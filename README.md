@@ -137,7 +137,7 @@ This works because the per-session state lives in `~/.claude-rc-mcp/` on the dev
 
 ### `list_sessions`
 
-Lists the sessions with their URLs and mode, so you can tell which ones accept `send_prompt`: the running ones, and whether each is working, idle, waiting for input or stuck on a startup dialog, and the conversational ones that are no longer running (disconnected, or after a restart), with how long ago they were last active. Those stay listed, and resumable, for `SESSION_RETENTION_DAYS` (default 14) after their last activity, then their files are removed.
+Lists the sessions with their URLs and mode, so you can tell which ones accept `send_prompt`: the running ones, and whether each is working, idle, waiting for input or stuck on a startup dialog, and the conversational ones that are no longer running (disconnected, or after a restart), with how long ago they were last active. Those stay listed, and resumable, for `SESSION_RETENTION_DAYS` (default 14) after their last activity. Then the session is closed for good, exactly like `stop_session` - archived at claude.ai/code first, then removed from the list - in the background, and the next `list_sessions` reports it. One archived when it was disconnected is simply removed. One that cannot be archived from here (the archive failed, its transcript is gone, a legacy server) stays listed as **NOT archived**, with the reason and its URL, until `stop_session` removes it.
 
 ### `stop_session` and `disconnect_session`
 
@@ -182,7 +182,8 @@ Lists directories under `PROJECTS_BASE_DIR` that look like projects (contain a `
 | `SSH_PASSPHRASE` | No | Passphrase for an encrypted SSH key |
 | `CLAUDE_BIN` | No | `claude` binary on the server; set to an absolute path if not on the non-interactive SSH `PATH` (default: `claude`) |
 | `APPEND_SYSTEM_PROMPT` | No | Text appended to the system prompt of every conversational session, resumed ones included (see [Session system prompt](#session-system-prompt)) |
-| `SESSION_RETENTION_DAYS` | No | How long a session that is no longer running stays listed and resumable, counted from its last activity (default: `14`) |
+| `SESSION_RETENTION_DAYS` | No | How long a session that is no longer running stays listed and resumable, counted from its last activity, before it is closed for good and archived (default: `14`) |
+| `REMOTE_STATE_DIR` | No | Absolute path of the per-session records on the dev server (default: `~/.claude-rc-mcp`). A second instance, such as a test one, needs its own |
 | `TOKEN_STORE_PATH` | No | Where issued OAuth tokens are persisted (default: `/data/oauth-tokens.json`) |
 | `PORT` | No | Server port (default: `3000`) |
 

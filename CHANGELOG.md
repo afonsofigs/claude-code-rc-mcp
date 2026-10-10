@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0 - 2026-10-10
+
+### Changed
+
+- A session not active for `SESSION_RETENTION_DAYS` is closed for good like `stop_session` - archived at claude.ai/code first, then removed from `list_sessions` - instead of being forgotten unarchived. It happens in the background of a `list_sessions`, and the next one reports it. A session that cannot be archived from here stays listed as NOT archived, with the reason and its URL, until `stop_session` removes it; this includes legacy Remote Control server records, which used to be dropped silently.
+
+### Added
+
+- `REMOTE_STATE_DIR`: where the per-session records live on the dev server (default `~/.claude-rc-mcp`), so a test instance can keep apart from the real one.
+
 ## 1.3.0 - 2026-10-10
 
 ### Changed

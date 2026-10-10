@@ -10,6 +10,8 @@
 //   E2E_TOKEN    bearer token            (default "t")
 //   E2E_BASE     PROJECTS_BASE_DIR       (default /home/vscode/localCode)
 //   E2E_PROJECT  trusted test project    (default rc-mcp-test)
+//   E2E_STATE    the instance's REMOTE_STATE_DIR (default ~/.claude-rc-mcp-e2e), kept apart
+//                from the real one: expiry would otherwise close real sessions
 //   E2E_ONLY     comma-separated scenario names, to run a subset
 //
 // The trust_folder scenario trusts a fresh folder under E2E_PROJECT for good:
@@ -27,8 +29,10 @@ const TOKEN = process.env.E2E_TOKEN || "t";
 const BASE = process.env.E2E_BASE || "/home/vscode/localCode";
 const PROJECT = process.env.E2E_PROJECT || "rc-mcp-test";
 const ONLY = (process.env.E2E_ONLY || "").split(",").filter(Boolean);
-const STATE = `${homedir()}/.claude-rc-mcp`;
+// The instance under test must run with REMOTE_STATE_DIR set to this, apart from any real one.
+const STATE = process.env.E2E_STATE || `${homedir()}/.claude-rc-mcp-e2e`;
 const SESSIONS = `${process.env.CLAUDE_CONFIG_DIR || `${homedir()}/.claude`}/sessions`;
+const PROJECTS = `${process.env.CLAUDE_CONFIG_DIR || `${homedir()}/.claude`}/projects`;
 
 const sh = (cmd) => {
   try { return execSync(cmd, { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { return ""; }
@@ -65,6 +69,9 @@ const statusFiles = (id) => sh(`grep -l '"tmux": *"rc-${id}:' ${SESSIONS}/*.json
 const tmuxAlive = (id) => sh(`tmux has-session -t rc-${id} 2>/dev/null && echo yes`) === "yes";
 const recordExists = (id) => existsSync(`${STATE}/${id}.meta`);
 const filesLeft = (id) => sh(`ls ${STATE} | grep -F ${id}`);
+const transcriptOf = (id) => sh(`find ${PROJECTS} -maxdepth 2 -name "${meta(id).sessionId}.jsonl" | head -n 1`);
+/** Make a session look idle for longer than the retention (default 14 days). */
+const age = (id) => sh(`touch -d "40 days ago" "${transcriptOf(id)}"`);
 const meta = (id) => JSON.parse(readFileSync(`${STATE}/${id}.meta`, "utf-8"));
 
 /** Nothing of the session left running: tmux, process, status file. */
@@ -238,6 +245,63 @@ const scenarios = {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  },
+
+  // Sessions not active for longer than the retention are closed for good - archived first.
+  async expiry() {
+    // A session killed outright (as a restart does): expiring it resumes and ends it, archived.
+    const a = await startInteractive("e2e-expire");
+    if (!a.id) return;
+    sh(`kill -9 ${a.pid}`);
+    await sleep(1500);
+    age(a.id);
+    let r = await call("list_sessions");
+    check(new RegExp(`${a.id}.*being closed for good`).test(r.text), "list_sessions starts closing an expired session, and says so");
+    let closedLine = "";
+    for (let i = 0; i < 24 && !closedLine; i++) {
+      await sleep(5000);
+      r = await call("list_sessions");
+      closedLine = r.text.split("\n").find((l) => l.includes(a.id) && /archive=200/.test(l)) || "";
+    }
+    check(/Closed for good after/.test(r.text) && Boolean(closedLine), "a later list_sessions reports it closed and archived (archive=200)");
+    check(!r.text.split("Sessions (")[1]?.includes(a.id), "and no longer lists it");
+    checkGone(a.id, a.pid);
+    check(!recordExists(a.id) && filesLeft(a.id) === "", "its record is removed, with every file of it");
+
+    // Disconnected (so archived already) and then expired: forgotten, with no resume.
+    const b = await startInteractive("e2e-expire-disc");
+    if (b.id) {
+      await call("disconnect_session", { id: b.id });
+      age(b.id);
+      r = await call("list_sessions");
+      check(!r.text.includes(b.id) && !tmuxAlive(b.id) && !recordExists(b.id), "an expired disconnected session is forgotten at once, without a resume");
+    }
+
+    // One that cannot be archived from here (its transcript is gone): it stays, flagged, with its URL.
+    const c = await startInteractive("e2e-expire-gone");
+    if (c.id) {
+      sh(`kill -9 ${c.pid}`);
+      await sleep(1500);
+      const tr = transcriptOf(c.id);
+      sh(`mv "${tr}" "${tr}.e2e"`);
+      r = await call("list_sessions");
+      check(new RegExp(`${c.id}.*NOT archived at claude.ai/code \\(its transcript is gone`).test(r.text) && r.text.includes(c.url),
+        "a session that cannot be archived stays listed as NOT archived, with the reason and its URL");
+      check(recordExists(c.id), "its record is kept");
+      sh(`mv "${tr}.e2e" "${tr}"`);
+      r = await call("stop_session", { id: c.id });
+      check(!r.isError && /archive=200/.test(r.text), "once it can be resumed, stop_session archives it and removes it");
+      check(!recordExists(c.id) && !tmuxAlive(c.id), "and it is gone");
+    }
+
+    // A legacy Remote Control server that is not running: flagged too, never silently dropped.
+    const id = `e2e-srv-off-${randomBytes(3).toString("hex")}`;
+    writeFileSync(`${STATE}/${id}.meta`, JSON.stringify({ mode: "server", dir: `${BASE}/${PROJECT}`, name: "e2e-srv-off", bypass: false }));
+    writeFileSync(`${STATE}/${id}.url`, "https://claude.ai/code?environment=env_e2eOff");
+    r = await call("list_sessions");
+    check(new RegExp(`${id}.*NOT archived.*legacy Remote Control server`).test(r.text), "a legacy server that is not running stays listed as NOT archived");
+    r = await call("stop_session", { id });
+    check(!r.isError && !recordExists(id) && filesLeft(id) === "", "stop_session removes it");
   },
 
   // The old parameters, and what they no longer do: no Remote Control server is launched.

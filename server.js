@@ -41,7 +41,10 @@ const RC_SYSTEM_PROMPT =
   "tags: treat the text inside them as the user's own message, written by them for this session.";
 const SESSION_SYSTEM_PROMPT = [RC_SYSTEM_PROMPT, APPEND_SYSTEM_PROMPT].filter(Boolean).join("\n\n");
 const SESSION_RETENTION_DAYS = parseFloat(process.env.SESSION_RETENTION_DAYS || "14");
-const VERSION = "1.3.0";
+// Where the per-session records live on the dev server (default ~/.claude-rc-mcp). A second
+// instance - a test one - needs its own, or it would manage the first one's sessions.
+const REMOTE_STATE_DIR = process.env.REMOTE_STATE_DIR || "";
+const VERSION = "1.4.0";
 
 // Run as the server, or imported by the tests for its pure functions - which
 // must not exit on missing configuration nor open a port.
@@ -52,6 +55,10 @@ const required = { MCP_SECRET, SERVER_URL, SSH_HOST, SSH_USER, SSH_PRIVATE_KEY, 
 const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
 if (IS_MAIN && missing.length) {
   console.error(`Error: missing required environment variables: ${missing.join(", ")}`);
+  process.exit(1);
+}
+if (IS_MAIN && REMOTE_STATE_DIR && !/^\/[a-zA-Z0-9._/-]+$/.test(REMOTE_STATE_DIR)) {
+  console.error("Error: REMOTE_STATE_DIR must be an absolute path of [a-zA-Z0-9._/-]");
   process.exit(1);
 }
 
@@ -361,7 +368,7 @@ const fail = (text) => ({ content: [{ type: "text", text }], isError: true });
 let stateDirCache = null;
 async function stateDir() {
   if (stateDirCache) return stateDirCache;
-  const r = await sshExec(`d="$HOME/.claude-rc-mcp"; mkdir -p "$d" && printf %s "$d"`);
+  const r = await sshExec(`d="${REMOTE_STATE_DIR || "$HOME/.claude-rc-mcp"}"; mkdir -p "$d" && printf %s "$d"`);
   const dir = r.stdout.trim();
   if (!/^\/[a-zA-Z0-9._/-]+$/.test(dir)) {
     throw new Error(`unexpected state directory on the remote server: "${dir}"`);
@@ -602,6 +609,7 @@ async function launchConversation(S, id, meta, { task = "", resume = false, trus
   // Launching brings the session back to claude.ai/code, archived or not.
   const record = { ...meta };
   delete record.archivedAt;
+  delete record.archiveFailed;
   const setup = [
     remoteWrite(file("meta"), JSON.stringify(record)),
     remoteWrite(file("sys"), SESSION_SYSTEM_PROMPT),
@@ -1198,6 +1206,95 @@ async function closeServer(S, id, state) {
   return { archive: serverArchiveOutcome(done.debug), url: state.url, notes, ended: done.gone, server: true };
 }
 
+// --- Expiry ---
+
+/**
+ * What list_sessions does with the record of a session that is not running:
+ *
+ * - "keep": listed, resumable.
+ * - "close": not active for SESSION_RETENTION_DAYS - closed for good, exactly
+ *   like stop_session (resumed and ended, so claude.ai/code archives it), and
+ *   only then forgotten (see expireSession).
+ * - "forget": removed at once, as nothing at claude.ai/code is left to
+ *   archive: it was archived when it was disconnected, or it never connected.
+ * - "flag": it cannot be archived from here, so it stays listed as not
+ *   archived, with its URL, until stop_session removes it: a legacy Remote
+ *   Control server (which never archives its sessions), a record without
+ *   metadata, a transcript that is gone (nothing to resume), or an earlier
+ *   attempt that failed.
+ *
+ * A record marked `expiringSince` is closed whatever its transcript says: the
+ * resume that closing it starts with writes to the transcript too.
+ *
+ * `searched` says the shell looked up the conversation id this record holds;
+ * when it did not (an unreadable record), nothing is decided on it.
+ */
+function expiryAction({ meta, searched, lastActive, url, now, retentionMs }) {
+  if (meta?.mode !== "session") return url ? "flag" : "forget";
+  if (!searched) return "keep";
+  // Closing it had started when this server restarted; its resume refreshed the transcript.
+  if (meta.expiringSince) return "close";
+  if (lastActive && now - lastActive <= retentionMs) return "keep";
+  if (meta.archivedAt) return "forget";
+  if (meta.archiveFailed) return "flag";
+  if (!lastActive) return url ? "flag" : "forget";
+  return "close";
+}
+
+/** Why a flagged record could not be archived from here. */
+function flagReason(meta) {
+  if (meta?.mode === "server") return "a legacy Remote Control server keeps its environment and archives none of its sessions";
+  if (!meta) return "it has no metadata to resume it with";
+  if (meta.archiveFailed?.reason) return meta.archiveFailed.reason;
+  return "its transcript is gone, so it cannot be resumed to archive it";
+}
+
+/** Expired sessions being closed right now, so that overlapping list_sessions calls do not close one twice. */
+const expiring = new Set();
+
+/** Expired sessions closed for good since the last list_sessions, which reports (and clears) them. */
+const expiredReports = [];
+
+/**
+ * Close an expired session for good, in the background of a list_sessions
+ * call: a resume and a clean exit take a while, and the listing should not.
+ * The record says `expiringSince` meanwhile, so that a session left running by
+ * a restart of this server halfway through is closed by a later listing. On
+ * success the record goes, and the next listing says so; otherwise it stays,
+ * flagged `archiveFailed`, with the reason, and is listed as not archived.
+ */
+async function expireSession(S, id, state) {
+  if (expiring.has(id)) return;
+  expiring.add(id);
+  try {
+    const meta = { ...state.meta, expiringSince: state.meta.expiringSince || new Date().toISOString() };
+    if (!state.meta.expiringSince) await saveMeta(S, id, meta);
+    const closed = await closeConversation(S, id, { ...state, meta });
+    if (closed.ended && closed.archive?.archived) {
+      await sshExec(`rm -f ${recordFiles(S, id)}`);
+      expiredReports.push({ id, line: archiveLine(closed) });
+      console.log(`[expire] ${id}: closed for good, archived`);
+      return;
+    }
+    const why = closed.archive ? `the bridge reported archive=${closed.archive.status}` : closed.notes.join("; ") || "there is no record of the archive";
+    await flagRecord(S, id, meta, closed.ended ? why : `${why}; its process could not be confirmed gone`);
+    console.log(`[expire] ${id}: NOT archived (${why})`);
+  } catch (err) {
+    await flagRecord(S, id, state.meta, `closing it failed: ${err.message}`).catch(() => {});
+    console.error(`[expire] ${id}: ${err.message}`);
+  } finally {
+    expiring.delete(id);
+  }
+}
+
+/** Mark a record as not archived, building on what is on disk now (a resume rewrites it). */
+async function flagRecord(S, id, meta, reason) {
+  const current = parseMeta((await sshExec(`cat ${S}/${id}.meta 2>/dev/null; true`)).stdout) || meta;
+  const flagged = { ...current, archiveFailed: { at: new Date().toISOString(), reason } };
+  delete flagged.expiringSince;
+  await saveMeta(S, id, flagged);
+}
+
 /** One line on what claude.ai/code made of a session that was closed. */
 function archiveLine(closed) {
   if (closed.notRunning) {
@@ -1740,7 +1837,8 @@ function createMcpServer() {
       "and the conversational ones that are no longer running (disconnected, or after a dev server restart), which `send_prompt` / `get_reply` / `resume_session` pick up again. " +
       "`conversational` sessions are the ones `send_prompt` / `get_reply` can talk to. " +
       "Use when the user asks 'what sessions are running', 'do I have a session for X', before `start_session` to avoid duplicates, " +
-      `or to look up the id of the session they want to send a prompt to. Sessions not running for more than ${SESSION_RETENTION_DAYS} days are forgotten.`,
+      `or to look up the id of the session they want to send a prompt to. A session not active for more than ${SESSION_RETENTION_DAYS} days is closed for good, like stop_session: ` +
+      "archived at claude.ai/code first, then removed from the list; one that cannot be archived stays listed as NOT archived, with its URL, until stop_session removes it.",
     {},
     async () => {
       try {
@@ -1763,6 +1861,7 @@ function createMcpServer() {
         const known = new Set();
         const stale = [];
         const followed = [];
+        const toExpire = [];
         const retentionMs = SESSION_RETENTION_DAYS * 86400000;
         for (const line of r.stdout.split("\n")) {
           const [kind, id, ...f] = line.trim().split(" ");
@@ -1774,7 +1873,13 @@ function createMcpServer() {
             const moved = followConversation(meta, live);
             if (moved) followed.push(remoteWrite(`${S}/${id}.meta`, JSON.stringify(moved)));
             const dialog = live ? null : startupDialog(stripAnsi(fromB64(paneB64)));
-            sessions.push({ id, running: true, meta, live, dialog, url: live?.url || (url !== "-" ? url : null) });
+            const sessionUrl = live?.url || (url !== "-" ? url : null);
+            // Resumed to be closed when this server restarted halfway through: finish the job.
+            const expiringFor = Date.now() - Date.parse(meta?.expiringSince || "");
+            if (meta?.mode === "session" && expiringFor > 120000 && !expiring.has(id)) {
+              toExpire.push({ id, state: { alive: true, meta, live, url: sessionUrl } });
+            }
+            sessions.push({ id, running: true, meta, live, dialog, url: sessionUrl, expiring: Boolean(meta?.expiringSince) });
             known.add(id);
           } else if (kind === "OFF") {
             const [sid, mtime, metaB64, url] = f;
@@ -1786,18 +1891,30 @@ function createMcpServer() {
             // the record holds: files are deleted on it, so a record the shell
             // could not read is kept rather than taken for a dead one.
             const searched = sid === metaSessionId(meta);
-            if (meta?.mode !== "session" || (searched && (!lastActive || Date.now() - lastActive > retentionMs))) {
+            const recordUrl = url !== "-" ? url : null;
+            const action = expiryAction({ meta, searched, lastActive, url: recordUrl, now: Date.now(), retentionMs });
+            if (action === "forget") {
               stale.push(id);
               continue;
             }
-            sessions.push({ id, running: false, meta, lastActive, url: url !== "-" ? url : null });
+            if (action === "close") toExpire.push({ id, state: { alive: false, meta, live: null, url: recordUrl } });
+            sessions.push({
+              id, running: false, meta, lastActive, url: recordUrl,
+              expiring: action === "close", flagged: action === "flag",
+            });
           } else if (kind === "TMUX" && !known.has(id)) {
             sessions.push({ id, running: true, meta: null, live: null, url: null });
           }
         }
         const upkeep = [...followed, ...stale.map((id) => `rm -f ${recordFiles(S, id)}`)];
         if (upkeep.length) await sshExec(`${upkeep.join("; ")}; true`);
-        if (!sessions.length) return ok("No sessions.");
+        for (const { id, state } of toExpire) expireSession(S, id, state);
+        const reports = expiredReports.splice(0);
+        const closedNote = reports.length
+          ? `Closed for good after ${SESSION_RETENTION_DAYS} days without activity:\n` +
+            reports.map((x) => `• ${x.id}  -  ${x.line}`).join("\n") + "\n\n"
+          : "";
+        if (!sessions.length) return ok(`${closedNote}No sessions.`);
 
         const status = (live, dialog) => {
           if (dialog === "trust") return "stuck on the folder trust dialog, not connected to claude.ai/code";
@@ -1812,16 +1929,21 @@ function createMcpServer() {
         const body = sessions
           .map((s) => {
             const kind = s.meta?.mode === "session" ? "conversational" : s.meta?.mode === "server" ? "legacy remote-control server" : "no metadata";
-            const state = s.running
-              ? (s.meta?.mode === "session" ? status(s.live, s.dialog) : "running")
-              : `${s.meta?.archivedAt ? "disconnected (archived at claude.ai/code)" : "not running"}` +
-                `${s.lastActive ? ` (last active ${ago(s.lastActive)} ago)` : ""}, resumable`;
+            const idle = s.lastActive ? ` (last active ${ago(s.lastActive)} ago)` : "";
+            const state = s.expiring
+              ? `not active for more than ${SESSION_RETENTION_DAYS} days${idle}: being closed for good (archived at claude.ai/code first)`
+              : s.flagged
+                ? `not running${idle}, NOT archived at claude.ai/code (${flagReason(s.meta)}). ` +
+                  `Archive it by hand${s.url ? " at the URL below" : " at https://claude.ai/code"}; stop_session removes it from this list`
+                : s.running
+                  ? (s.meta?.mode === "session" ? status(s.live, s.dialog) : "running")
+                  : `${s.meta?.archivedAt ? "disconnected (archived at claude.ai/code)" : "not running"}${idle}, resumable`;
             return `• ${s.id}  -  ${kind} · ${state}${s.url ? `\n    ${s.url}` : ""}`;
           })
           .join("\n");
         const running = sessions.filter((s) => s.running).length;
         return ok(
-          `Sessions (${running} running, ${sessions.length - running} not running):\n${body}` +
+          `${closedNote}Sessions (${running} running, ${sessions.length - running} not running):\n${body}` +
           (sessions.some((s) => s.meta?.mode === "session")
             ? `\n\nConversational sessions accept \`send_prompt\` / \`get_reply\`; ones that are not running are resumed automatically ` +
               `(which also unarchives them at claude.ai/code). \`stop_session\` closes one for good.`
@@ -1840,6 +1962,9 @@ function createMcpServer() {
    */
   async function closeSession(id, { keep }) {
     const S = await stateDir();
+    if (expiring.has(id)) {
+      return { error: `Session "${id}" is already being closed for good, because it was not active for ${SESSION_RETENTION_DAYS} days. list_sessions reports the outcome.` };
+    }
     const state = await readState(S, id);
     if (!state.meta && !state.alive) return { error: `No session with id "${id}".` };
     if (keep && state.meta?.mode !== "session") {
@@ -1864,8 +1989,13 @@ function createMcpServer() {
       // A resume while closing rewrote the record (a later conversation, say): build on that one.
       const current = parseMeta((await sshExec(`cat ${S}/${id}.meta 2>/dev/null; true`)).stdout) || state.meta;
       const meta = { ...current };
-      if (closed.archive?.archived) meta.archivedAt = new Date().toISOString();
-      else delete meta.archivedAt;
+      delete meta.expiringSince;
+      if (closed.archive?.archived) {
+        meta.archivedAt = new Date().toISOString();
+        delete meta.archiveFailed;
+      } else {
+        delete meta.archivedAt;
+      }
       await sshExec(`${remoteWrite(`${S}/${id}.meta`, JSON.stringify(meta))}; rm -f ${S}/${id}.send ${S}/${id}.prompt ${S}/${id}.debug`);
     } else {
       await sshExec(`rm -f ${recordFiles(S, id)}`);
@@ -2068,4 +2198,5 @@ export {
   stripAnsi, extractSessionUrl, parseLive, parseJsonl, turnAfter, outcomeOf,
   startupDialog, TRUST_YES_SELECTED_RE, dialogMessage, untrustedMessage, trustedBy,
   archiveOutcome, serverArchiveOutcome, bridgeConnected, archiveLine, formatOutcome,
+  expiryAction, flagReason,
 };
