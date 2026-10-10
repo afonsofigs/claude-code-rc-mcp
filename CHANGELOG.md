@@ -25,6 +25,11 @@
 
 - `stop_session`'s `forget`, and `start_session`'s `interactive` and `worktree`: accepted and ignored. They will be removed in the next version.
 
+### Security
+
+- `@modelcontextprotocol/sdk` 1.30.0 → 1.32.1 (GHSA-6qxp-vccf-f47h, high: affects the SDK's OAuth client, which this server does not use). Its range is raised to `^1.32.1`. Nothing changes on the wire: `initialize`, `tools/list`, tool errors, the OAuth metadata and the 401/404 answers are identical before and after.
+- Transitive: `proxy-addr` 2.0.8 (GHSA-jqcg-44mw-7w3h, critical), `fast-uri` 3.1.8 (GHSA-hrr3-gc8f-f4qj), `hono` 4.13.13 (GHSA-hxh3-vqpv-xpqv), `ip-address` 10.7.3 (GHSA-j6r3-76f7-8jcv, GHSA-h3mg-xc3c-68pw). `npm audit` reports no vulnerabilities.
+
 ### Fixed
 
 - A session stuck on the folder trust dialog was reported by `get_reply` as "still working", and a `send_prompt` would have answered the dialog with its default, "No, exit".
