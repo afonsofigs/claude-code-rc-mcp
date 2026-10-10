@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.1 - 2026-10-10
+
+### Changed
+
+- `list_sessions` says how long a running session has been idle or waiting for input, in the same form as a stopped one: `idle (last active 7h ago)`, `waiting for input (…) (last active 2h ago)`. One pattern, `(last active <n><s|m|h|d> ago)`, now reads it for any session.
+- These durations are whole units rounded down, so `6h` always means at least six hours.
+
 ## 1.4.0 - 2026-10-10
 
 ### Changed

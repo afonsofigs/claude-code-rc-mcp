@@ -44,7 +44,7 @@ const SESSION_RETENTION_DAYS = parseFloat(process.env.SESSION_RETENTION_DAYS || 
 // Where the per-session records live on the dev server (default ~/.claude-rc-mcp). A second
 // instance - a test one - needs its own, or it would manage the first one's sessions.
 const REMOTE_STATE_DIR = process.env.REMOTE_STATE_DIR || "";
-const VERSION = "1.4.0";
+const VERSION = "1.4.1";
 
 // Run as the server, or imported by the tests for its pure functions - which
 // must not exit on missing configuration nor open a port.
@@ -1453,12 +1453,33 @@ function formatOutcome(id, result, { url, waitedSeconds, notes = [] }) {
 }
 
 /** "3m", "5h", "2d" - how long ago an epoch-ms instant was. */
-function ago(ms) {
-  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+function ago(ms, now = Date.now()) {
+  // Whole units, rounded down, so "6h" always means at least six hours: the
+  // monitoring routine compares these against thresholds.
+  const s = Math.max(0, Math.floor((now - ms) / 1000));
   if (s < 90) return `${s}s`;
-  if (s < 90 * 60) return `${Math.round(s / 60)}m`;
-  if (s < 36 * 3600) return `${Math.round(s / 3600)}h`;
-  return `${Math.round(s / 86400)}d`;
+  if (s < 90 * 60) return `${Math.floor(s / 60)}m`;
+  if (s < 36 * 3600) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+/**
+ * How list_sessions describes a running conversational session. One that is
+ * idle or waiting says since when - the time its status last changed, which
+ * is when its turn ended or its question opened - in the same "(last active
+ * … ago)" form as a session that is not running, so a single pattern reads
+ * how long any session has been sitting there.
+ */
+function liveStatusText(live, dialog, now = Date.now()) {
+  if (dialog === "trust") return "stuck on the folder trust dialog, not connected to claude.ai/code";
+  if (dialog) return "stuck on a startup dialog, not connected to claude.ai/code";
+  if (!live) return "running";
+  const since = live.statusUpdatedAt ? ` (last active ${ago(live.statusUpdatedAt, now)} ago)` : "";
+  if (live.status === "busy") return "working";
+  if (live.status === "waiting") return `waiting for input (${live.waitingFor || "dialog open"})${since}`;
+  if (live.status === "shell") return `idle, background shell running${since}`;
+  if (live.status === "idle") return `idle${since}`;
+  return live.status || "running";
 }
 
 const SERVER_INSTRUCTIONS = `
@@ -1833,7 +1854,7 @@ function createMcpServer() {
 
   server.tool(
     "list_sessions",
-    "List the Claude Code sessions on the remote server: the running ones, with their URL, mode and whether they are working, idle or waiting for input, " +
+    "List the Claude Code sessions on the remote server: the running ones, with their URL, mode and whether they are working, idle or waiting for input (and since when), " +
       "and the conversational ones that are no longer running (disconnected, or after a dev server restart), which `send_prompt` / `get_reply` / `resume_session` pick up again. " +
       "`conversational` sessions are the ones `send_prompt` / `get_reply` can talk to. " +
       "Use when the user asks 'what sessions are running', 'do I have a session for X', before `start_session` to avoid duplicates, " +
@@ -1916,15 +1937,6 @@ function createMcpServer() {
           : "";
         if (!sessions.length) return ok(`${closedNote}No sessions.`);
 
-        const status = (live, dialog) => {
-          if (dialog === "trust") return "stuck on the folder trust dialog, not connected to claude.ai/code";
-          if (dialog) return "stuck on a startup dialog, not connected to claude.ai/code";
-          if (!live) return "running";
-          if (live.status === "busy") return "working";
-          if (live.status === "waiting") return `waiting for input (${live.waitingFor || "dialog open"})`;
-          if (live.status === "shell") return "idle, background shell running";
-          return live.status || "running";
-        };
         sessions.sort((a, b) => (b.running - a.running) || ((b.lastActive || 0) - (a.lastActive || 0)));
         const body = sessions
           .map((s) => {
@@ -1936,7 +1948,7 @@ function createMcpServer() {
                 ? `not running${idle}, NOT archived at claude.ai/code (${flagReason(s.meta)}). ` +
                   `Archive it by hand${s.url ? " at the URL below" : " at https://claude.ai/code"}; stop_session removes it from this list`
                 : s.running
-                  ? (s.meta?.mode === "session" ? status(s.live, s.dialog) : "running")
+                  ? (s.meta?.mode === "session" ? liveStatusText(s.live, s.dialog) : "running")
                   : `${s.meta?.archivedAt ? "disconnected (archived at claude.ai/code)" : "not running"}${idle}, resumable`;
             return `• ${s.id}  -  ${kind} · ${state}${s.url ? `\n    ${s.url}` : ""}`;
           })
@@ -2198,5 +2210,5 @@ export {
   stripAnsi, extractSessionUrl, parseLive, parseJsonl, turnAfter, outcomeOf,
   startupDialog, TRUST_YES_SELECTED_RE, dialogMessage, untrustedMessage, trustedBy,
   archiveOutcome, serverArchiveOutcome, bridgeConnected, archiveLine, formatOutcome,
-  expiryAction, flagReason,
+  expiryAction, flagReason, ago, liveStatusText,
 };

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import {
   parseLive, parseJsonl, turnAfter, startupDialog, TRUST_YES_SELECTED_RE, trustedBy,
   archiveOutcome, serverArchiveOutcome, bridgeConnected, archiveLine, formatOutcome,
-  expiryAction, flagReason,
+  expiryAction, flagReason, ago, liveStatusText,
 } from "../server.js";
 
 const fixture = (name) => readFileSync(new URL(`fixtures/${name}`, import.meta.url), "utf-8");
@@ -237,4 +237,37 @@ test("a flagged record says why it is not archived", () => {
   assert.match(flagReason(conv({ archiveFailed: { reason: "the bridge reported archive=500" } })), /archive=500/);
   assert.match(flagReason(conv()), /transcript is gone/);
   assert.match(flagReason(null), /no metadata/);
+});
+
+// --- How long a session has been sitting there ---
+
+test("ago counts whole units, rounded down, so a threshold is never reached early", () => {
+  const t = Date.parse("2026-10-10T12:00:00Z");
+  assert.equal(ago(t - 89 * 1000, t), "89s");
+  assert.equal(ago(t - 90 * 1000, t), "1m");
+  assert.equal(ago(t - (5 * 3600 + 59 * 60) * 1000, t), "5h");
+  assert.equal(ago(t - 6 * 3600 * 1000, t), "6h");
+  assert.equal(ago(t - 35 * 3600 * 1000, t), "35h");
+  assert.equal(ago(t - 36 * 3600 * 1000, t), "1d");
+});
+
+test("a running session that is idle or waiting says since when; a working one does not", () => {
+  const t = Date.parse("2026-10-10T12:00:00Z");
+  const since = t - 7 * 3600 * 1000;
+  assert.equal(liveStatusText({ status: "idle", statusUpdatedAt: since }, null, t), "idle (last active 7h ago)");
+  assert.equal(liveStatusText({ status: "shell", statusUpdatedAt: since }, null, t), "idle, background shell running (last active 7h ago)");
+  assert.equal(
+    liveStatusText({ status: "waiting", waitingFor: "AskUserQuestion", statusUpdatedAt: since }, null, t),
+    "waiting for input (AskUserQuestion) (last active 7h ago)"
+  );
+  assert.equal(liveStatusText({ status: "busy", statusUpdatedAt: since }, null, t), "working");
+  assert.equal(liveStatusText(null, null, t), "running");
+  assert.equal(liveStatusText({ status: "idle", statusUpdatedAt: 0 }, null, t), "idle");
+  assert.match(liveStatusText(null, "trust", t), /^stuck on the folder trust dialog/);
+});
+
+test("the running and the stopped forms share one pattern", () => {
+  const re = /\(last active (\d+)([smhd]) ago\)/;
+  const t = Date.parse("2026-10-10T12:00:00Z");
+  assert.deepEqual(liveStatusText({ status: "idle", statusUpdatedAt: t - 8 * 3600 * 1000 }, null, t).match(re).slice(1), ["8", "h"]);
 });

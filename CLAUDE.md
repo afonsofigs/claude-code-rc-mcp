@@ -164,7 +164,11 @@ node --env-file=.env server.js
   exits cleanly deletes its file, so the conversation id is copied into `meta`
   wherever the status is read (`followConversation`); after a crash, the
   newest file naming the tmux session says which conversation it was last in
-  (`lastConversation`), including a `/clear` nothing here saw.
+  (`lastConversation`), including a `/clear` nothing here saw. Its
+  `statusUpdatedAt` is when the status last changed, so `list_sessions` shows
+  an idle or waiting session as `(last active 7h ago)`, the same form as a
+  stopped one's transcript age: the monitoring routine reads both with one
+  pattern, and `ago()` rounds down so a threshold is never reached early.
 - **Command output ends a turn too** - a slash command gets no assistant
   message: `/compact` ends on a user entry `<local-command-stdout>…`, dialog
   commands (`/model`, `/cost`) log `system`/`local_command` entries instead, and

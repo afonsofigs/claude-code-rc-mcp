@@ -115,7 +115,8 @@ const scenarios = {
     check(!r.isError && /Interrupted/.test(r.text), "interrupt_session stops it");
 
     r = await call("list_sessions");
-    check(r.text.includes(s.id), "list_sessions lists it");
+    check(new RegExp(`${s.id}  -  conversational · idle \\(last active \\d+[sm] ago\\)`).test(r.text),
+      "list_sessions lists it idle, and since when");
 
     r = await call("disconnect_session", { id: s.id });
     check(!r.isError && /archive=200/.test(r.text), "disconnect_session confirms the archive");
