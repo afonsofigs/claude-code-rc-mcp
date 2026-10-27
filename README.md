@@ -234,14 +234,16 @@ npm run e2e      # every tool against a local instance on the dev server - see C
 1. Deploy with HTTPS (e.g. behind a Cloudflare Tunnel or any reverse proxy).
 2. Check the server logs for `client_id` and `client_secret` (printed on startup).
 3. Go to [claude.ai/settings/connectors](https://claude.ai/settings/connectors) → **Add custom connector**.
-4. Enter the URL `https://your-domain.com/mcp` and the `client_id` / `client_secret`.
+4. Enter the URL `https://your-domain.com/mcp`, open **Advanced settings** and paste the `client_id` / `client_secret` there. They have to be entered by hand: the server does not support dynamic client registration, so a connector added without them cannot link.
 5. The connector links automatically and is available in conversations and scheduled tasks.
 
 ## Authentication & Security
 
 OAuth 2.1, same model as a small set of self-hosted MCP connectors:
 
-- **Fixed client credentials** — `client_id` / `client_secret` derived deterministically from `MCP_SECRET` via SHA-256. No registration page, no user database.
+- **Fixed client credentials** — `client_id` / `client_secret` derived deterministically from `MCP_SECRET` via SHA-256. No dynamic client registration (`/register` is neither served nor advertised), no user database: the credentials only reach a client by being pasted into its settings.
+- **Rotating `MCP_SECRET` revokes everything**: on startup, codes and tokens issued to the previous `client_id` are dropped from the token store, and a bearer token of another client is refused.
+- **Revocation**: `POST /revoke` (RFC 7009) revokes an access or refresh token, only when it belongs to the authenticated client.
 - **Auto-approve `/authorize`** — security comes from the fixed credentials: only someone with `MCP_SECRET` can derive valid ones.
 - **PKCE (S256)** — mandatory for every authorization flow.
 - **Redirect URI lockdown** — only `claude.ai` / `claude.com` callback URLs are accepted.
@@ -256,9 +258,9 @@ OAuth 2.1, same model as a small set of self-hosted MCP connectors:
 | `GET /health` | No | Health check |
 | `GET /.well-known/oauth-authorization-server` | No | OAuth metadata (RFC 8414) |
 | `GET /.well-known/oauth-protected-resource` | No | Protected resource metadata (RFC 9728) |
-| `POST /register` | No | Client registration (returns the fixed client) |
 | `GET /authorize` | No | OAuth authorization (auto-approve) |
-| `POST /token` | No | Token exchange |
+| `POST /token` | Client credentials | Token exchange |
+| `POST /revoke` | Client credentials | Token revocation (RFC 7009) |
 | `POST /mcp` · `GET /mcp` · `DELETE /mcp` | Bearer | Streamable HTTP MCP transport |
 
 ## Kubernetes Deployment

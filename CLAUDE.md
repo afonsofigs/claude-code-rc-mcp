@@ -243,7 +243,10 @@ node --env-file=.env server.js
 - **OAuth 2.1 file-persisted** — tokens stored in `TOKEN_STORE_PATH` via `TokenStore`.
   Single-instance store; clients survive pod restarts if the path is on a volume.
 - **Fixed client credentials** — `client_id` / `client_secret` derived from
-  `MCP_SECRET` via SHA-256. No dynamic registration from unknown clients.
+  `MCP_SECRET` via SHA-256. No dynamic registration: `/register` is not served,
+  so the credentials are pasted by hand into the connector's settings.
+- **Rotating `MCP_SECRET` revokes everything** — on startup the token store drops
+  codes and tokens issued to the previous `client_id`.
 - **Shell-injection hardening** — `name`, `path` and `id` are strictly validated
   before being interpolated into SSH commands.
 - **Opt-in bypass permissions** — `start_session` accepts a `bypass_permissions`

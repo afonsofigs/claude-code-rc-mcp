@@ -89,6 +89,28 @@ class TokenStore {
       console.warn(`[tokenstore] Failed to load ${this.filePath}: ${err.message}, starting fresh`);
       this.data = { tokens: {}, codes: {} };
     }
+    this._dropForeign();
+  }
+
+  /**
+   * The client id is derived from MCP_SECRET, so rotating the secret must
+   * revoke everything issued before it. Every record names its client (tokens
+   * by `clientId`, codes by `client.client_id`); one that names another
+   * client, or none, is dropped.
+   */
+  _dropForeign() {
+    const { tokens = {}, codes = {} } = this.data;
+    const keep = (entries, idOf) => Object.fromEntries(entries.filter(([, v]) => idOf(v) === FIXED_CLIENT_ID));
+    this.data = {
+      tokens: keep(Object.entries(tokens), (v) => v?.clientId),
+      codes: keep(Object.entries(codes), (v) => v?.client?.client_id),
+    };
+    const dropped = Object.keys(tokens).length + Object.keys(codes).length -
+      Object.keys(this.data.tokens).length - Object.keys(this.data.codes).length;
+    if (dropped) {
+      console.log(`[tokenstore] Dropped ${dropped} record(s) issued to another client (MCP_SECRET rotated)`);
+      this._save();
+    }
   }
 
   _save() {
@@ -121,11 +143,11 @@ class ClientsStore {
       token_endpoint_auth_method: "client_secret_post",
     };
   }
+  // No registerClient: without it the SDK neither mounts nor advertises
+  // /register, which would hand the fixed client_secret to anyone who asked.
+  // The credentials are entered by hand in the connector's settings.
   async getClient(clientId) {
     return clientId === FIXED_CLIENT_ID ? this.client : undefined;
-  }
-  async registerClient(_metadata) {
-    return this.client;
   }
 }
 
@@ -218,7 +240,7 @@ class OAuthProvider {
 
   async verifyAccessToken(token) {
     const data = this.store.getToken(token);
-    if (!data || data.type === "refresh") throw new Error("Invalid token");
+    if (!data || data.type === "refresh" || data.clientId !== FIXED_CLIENT_ID) throw new Error("Invalid token");
     if (data.expiresAt && data.expiresAt < Date.now()) {
       this.store.deleteToken(token);
       throw new Error("Token expired");
@@ -232,8 +254,10 @@ class OAuthProvider {
     };
   }
 
-  async revokeToken(token) {
-    this.store.deleteToken(token);
+  // RFC 7009: an unknown token, or one of another client, is still a 200.
+  async revokeToken(client, request) {
+    const data = this.store.getToken(request.token);
+    if (data && data.clientId === client.client_id) this.store.deleteToken(request.token);
   }
 }
 
